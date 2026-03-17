@@ -1,0 +1,21 @@
+# 忽略可执行文件
+*.exe
+Postman (x64).exe
+
+# Python相关
+__pycache__/
+venv/
+*.pyc
+*.pyo
+
+# 环境变量
+.env
+.env.local
+
+# IDE配置
+.vscode/
+.idea/
+
+# 日志/缓存
+logs/
+*.log
