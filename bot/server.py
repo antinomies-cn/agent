@@ -13,11 +13,6 @@ load_dotenv()
 
 app = FastAPI()
 
-import requests
-from langchain_core.language_models.chat_models import SimpleChatModel
-from langchain_core.messages import BaseMessage
-from langchain.tools import tool
-
 # 保留原有工具定义
 @tool
 def test():
