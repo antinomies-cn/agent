@@ -33,7 +33,7 @@ class CustomProxyLLM(SimpleChatModel):
     # 必须实现的抽象方法：返回LLM类型
     @property
     def _llm_type(self) -> str:
-        return "baishan-minimax-m2.5"  # 自定义类型标识
+        return "baishan"  # 自定义类型标识
 
     # 必须实现的核心方法：调用白山智算代理接口
     def _call(
@@ -50,10 +50,19 @@ class CustomProxyLLM(SimpleChatModel):
             "User-Agent": "LangChain-CustomLLM/1.0"  # 新增UA，避免接口拦截
         }
 
-        # 2. 转换LangChain Message格式为白山智算要求的格式
-        proxy_messages = [
-            {"role": m.type, "content": m.content} for m in messages
-        ]
+        # 2. 转换LangChain Message格式为白山智算要求的格式（修复角色名称映射问题）
+        # 核心修复：建立角色映射表，解决"角色信息不正确"的400错误
+        role_mapping = {
+            "human": "user",       # 人类用户输入映射为user
+            "ai": "assistant",     # AI回复映射为assistant
+            "system": "system"     # 系统提示映射为system
+        }
+        
+        proxy_messages = []
+        for m in messages:
+            # 获取映射后的角色名称，默认使用user避免报错
+            role = role_mapping.get(m.type, "user")
+            proxy_messages.append({"role": role, "content": m.content})
 
         # 3. 构造请求体（适配MiniMax-M2.5模型）
         data = {
@@ -77,6 +86,7 @@ class CustomProxyLLM(SimpleChatModel):
 
             # 打印调试信息（方便排查问题）
             print(f"请求URL：{request_url}")
+            print(f"请求体：{data}")  # 新增：打印请求体，确认角色名称是否正确
             print(f"代理响应状态码：{response.status_code}")
             print(f"代理响应内容：{response.text[:500]}")  # 截断长响应
 
