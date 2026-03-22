@@ -20,11 +20,17 @@ def test():
     """Test tool"""
     return "test"
 
+# 新增：区分开发/生产环境（控制日志输出）
+IS_PROD = os.getenv("ENV", "dev") == "prod"
+
 # 自定义 LLM
 class CustomProxyLLM(SimpleChatModel):
     api_key: str
     base_url: str
     model: str
+    # 新增：将关键生成参数设为可配置属性，默认值保留原有逻辑
+    temperature: float = 0.7  # 普通对话默认值
+    max_tokens: int = 3000     # 普通对话默认值
 
     @property
     def _llm_type(self) -> str:
@@ -34,9 +40,22 @@ class CustomProxyLLM(SimpleChatModel):
         self,
         messages: list[BaseMessage],
         stop=None,
-        run_manager=None,
-        **kwargs
+        run_manager=None,** kwargs
     ) -> str:
+        # 调整1：前置参数校验（高优先级）
+        if not self.api_key:
+            error_msg = "模型密钥未配置，请检查环境变量"
+            print(f"LLM参数错误: {error_msg}")
+            return "余暂时无法为你解答，系统配置异常（密钥）"
+        if not self.base_url:
+            error_msg = "模型接口地址未配置，请检查环境变量"
+            print(f"LLM参数错误: {error_msg}")
+            return "余暂时无法为你解答，系统配置异常（地址）"
+        if not self.model:
+            error_msg = "模型名称未配置，请检查环境变量"
+            print(f"LLM参数错误: {error_msg}")
+            return "余暂时无法为你解答，系统配置异常（模型）"
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -54,39 +73,89 @@ class CustomProxyLLM(SimpleChatModel):
             role = role_mapping.get(m.type, "user")
             proxy_messages.append({"role": role, "content": m.content})
 
+        # 调整2：使用实例属性而非硬编码参数
         data = {
             "model": self.model,
             "messages": proxy_messages,
-            "temperature": 0.7,
-            "max_tokens": 3000,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
             "stream": False
         }
 
         try:
             url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
             resp = requests.post(url, headers=headers, json=data, timeout=60)
+            
+            # 调整3：区分环境打印调试日志（中优先级）
+            if not IS_PROD:
+                print(f"LLM请求URL: {url}")
+                print(f"LLM请求体: {data}")
+                print(f"LLM响应状态码: {resp.status_code}")
+                print(f"LLM响应内容: {resp.text[:500]}")  # 截断避免日志过长
+
             resp.raise_for_status()
             result = resp.json()
             return result["choices"][0]["message"]["content"].strip()
 
+        # 调整4：精细化异常处理，返回用户友好提示（高优先级）
+        except requests.exceptions.HTTPError as e:
+            # 按状态码区分错误类型
+            status_code = resp.status_code
+            if status_code == 401:
+                error_log = "LLM调用失败：密钥无效/过期"
+                user_msg = "余的占卜法器暂时失灵（权限不足），请稍后再试"
+            elif status_code == 400:
+                error_log = f"LLM调用失败：请求参数错误 {resp.text[:200]}"
+                user_msg = "你的问题格式不太对，余无法解读，请换种方式提问"
+            elif status_code == 500:
+                error_log = "LLM调用失败：服务端内部错误"
+                user_msg = "星界信号不佳，余暂时无法为你占卜，请稍后再试"
+            else:
+                error_log = f"LLM HTTP错误 {status_code}：{resp.text[:200]}"
+                user_msg = "余的占卜术暂时失效，请稍后再试"
+            print(error_log)
+            return user_msg
+        except requests.exceptions.Timeout:
+            error_log = "LLM调用超时（60秒）"
+            print(error_log)
+            return "余正在推演答案，耗时稍久，请你耐心等待片刻后再问"
+        except requests.exceptions.ConnectionError:
+            error_log = "LLM调用失败：网络连接异常"
+            print(error_log)
+            return "天地信号中断，余无法连接占卜星象，请检查网络后再试"
+        except KeyError as e:
+            error_log = f"LLM响应解析失败：缺失字段 {e}，响应内容 {resp.text[:200]}"
+            print(error_log)
+            return "余解读答案时出现偏差，请换个问题试试"
         except Exception as e:
-            print(f"LLM调用异常: {e}")
-            return f"模型异常：{str(e)[:100]}"
+            error_log = f"LLM未知异常: {str(e)[:100]}"
+            print(error_log)
+            return "余的占卜罗盘出现异常，请稍后再试"
 
 # 主逻辑类
 class Master:
     def __init__(self):
-        self.chatmodel = CustomProxyLLM(
+        # ========== 关键修改1：创建两个LLM实例 ==========
+        # 1. 普通对话LLM（默认参数：temperature=0.3，max_tokens=3000）
+        self.normal_llm = CustomProxyLLM(
             api_key=os.getenv("OPENAI_API_KEY", ""),
             base_url=os.getenv("OPENAI_API_BASE", ""),
             model=os.getenv("OPENAI_MODEL", "")
+        )
+        # 2. 情绪识别LLM（自定义参数：temperature=0.1，max_tokens=10）
+        self.mood_llm = CustomProxyLLM(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=os.getenv("OPENAI_API_BASE", ""),
+            model=os.getenv("OPENAI_MODEL", ""),
+            temperature=0.1,  # 情绪识别低随机性
+            max_tokens=100     # 情绪识别只需要短输出
         )
 
         self.MOTION = "default"
         self.SYSTEMPL = """
         你是一个非常厉害的占卜大师
         以下是你的个人设定：
-        1.你不会透露自己的身份，但会用不同代号回答。
+        1.你不会透露自己的身份，但会用不同代号回答，代号都与占星相关。
         2.你大部分时候的回答都是事实，但很有趣。
         3.当你遇到不确定答案的问题时，你会选择出乎意料的回答。
         4.只有当你不知道怎么回答时，你会以“猜猜哪些是真相”之类的话结尾。
@@ -121,14 +190,17 @@ class Master:
         ])
 
         tools = [test]
-        agent = create_openai_tools_agent(self.chatmodel, tools, self.prompt)
+        # ========== 关键修改2：Agent使用普通对话LLM ==========
+        agent = create_openai_tools_agent(self.normal_llm, tools, self.prompt)
         self.agent_executor = AgentExecutor(
             agent=agent,
             tools=tools,
-            verbose=True,
-            handle_parsing_errors="请直接回答用户问题",
+            verbose=True,  # 保留：控制台能看到思考过程
+            handle_parsing_errors=lambda e: "返回到用户：解析失败，请直接回答问题",
             max_iterations=3,
-            early_stopping_method="force"
+            early_stopping_method="force",
+            return_intermediate_steps=False,  # 关键：禁止返回中间思考步骤
+            return_only_outputs=True,  # 新增：只返回最终output，不返回其他元数据
         )
 
     def _invoke_with_timeout(self, func, timeout):
@@ -172,7 +244,8 @@ class Master:
         用户输入：{query}
         """
         
-        chain = ChatPromptTemplate.from_template(prompt) | self.chatmodel | StrOutputParser()
+        # ========== 关键修改3：情绪识别使用mood_llm ==========
+        chain = ChatPromptTemplate.from_template(prompt) | self.mood_llm | StrOutputParser()
         try:
             r = self._invoke_with_timeout(lambda: chain.invoke({"query": query}), timeout).strip().lower()
             return r if r in self.MOODS else "default"
@@ -191,6 +264,19 @@ class Master:
                 ("user", "{input}"),
                 MessagesPlaceholder("agent_scratchpad"),
             ])
+            # 重建Agent（适配新的prompt和情绪）
+            tools = [test]
+            agent = create_openai_tools_agent(self.normal_llm, tools, self.prompt)
+            self.agent_executor = AgentExecutor(
+                agent=agent,
+                tools=tools,
+                verbose=True,
+                handle_parsing_errors=lambda e: "返回到用户：解析失败，请直接回答问题",
+                max_iterations=3,
+                early_stopping_method="force",
+                return_intermediate_steps=False,
+                return_only_outputs=True,
+            )
 
             remain = timeout - (time.time() - st)
             if remain <= 0:
@@ -203,6 +289,14 @@ class Master:
         except Exception as e:
             print(f"run异常: {e}")
             return {"output": f"服务异常：{str(e)[:100]}"}
+
+    # ========== 补充：修复WebSocket调用的run_async方法 ==========
+    async def run_async(self, query, timeout=60):
+        # 同步run方法的异步封装（适配WebSocket）
+        import asyncio
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(None, self.run, query, timeout)
+        return res
 
 # 全局单例（避免每次请求重建）
 master = Master()
@@ -238,10 +332,12 @@ async def ws(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            res = master.run(data)
-            await websocket.send_text(res.get("output", "无回复"))
+            res = await master.run_async(data)
+            # 只提取纯回答
+            clean_response = res.get("output", "抱歉，余暂时无法解答你的问题")
+            await websocket.send_text(clean_response)
     except WebSocketDisconnect:
-        print("断开连接")
+        print("连接断开")
 
 if __name__ == "__main__":
     import uvicorn
