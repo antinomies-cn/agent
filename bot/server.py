@@ -12,6 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.language_models import SimpleChatModel
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain.schema import StrOutputParser
+from texts import SYSTEMPL, MOODS, MOOD_CLASSIFY_PROMPT, USER_MESSAGES
 
 # 线程本地上下文：为LLM请求传递每次调用的超时
 _thread_ctx = threading.local()
@@ -110,15 +111,15 @@ class CustomProxyLLM(SimpleChatModel):
             if not self.api_key:
                 error_msg = "模型密钥未配置"
                 logger.error(f"LLM配置错误: {error_msg}")
-                return "余暂时无法为你解答，系统配置异常（密钥）"
+                return USER_MESSAGES["config"]["api_key"]
             if not self.base_url:
                 error_msg = "模型接口地址未配置"
                 logger.error(f"LLM配置错误: {error_msg}")
-                return "余暂时无法为你解答，系统配置异常（地址）"
+                return USER_MESSAGES["config"]["base_url"]
             if not self.model:
                 error_msg = "模型名称未配置"
                 logger.error(f"LLM配置错误: {error_msg}")
-                return "余暂时无法为你解答，系统配置异常（模型）"
+                return USER_MESSAGES["config"]["model"]
 
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
@@ -184,16 +185,16 @@ class CustomProxyLLM(SimpleChatModel):
             
             if status_code == 401:
                 error_log = "LLM调用失败：密钥无效/过期"
-                user_msg = "余的占卜法器暂时失灵（权限不足），请稍后再试"
+                user_msg = USER_MESSAGES["http"][401]
             elif status_code == 400:
                 error_log = f"LLM调用失败：请求参数错误 {response_text}"
-                user_msg = "你的问题格式不太对，余无法解读，请换种方式提问"
+                user_msg = USER_MESSAGES["http"][400]
             elif status_code == 500:
                 error_log = "LLM调用失败：服务端内部错误"
-                user_msg = "星界信号不佳，余暂时无法为你占卜，请稍后再试"
+                user_msg = USER_MESSAGES["http"][500]
             else:
                 error_log = f"LLM HTTP错误 {status_code}：{response_text}"
-                user_msg = "余的占卜术暂时失效，请稍后再试"
+                user_msg = USER_MESSAGES["http"]["default"]
             
             logger.error(f"{error_log} | 详细信息: {error_info}")
             return user_msg
@@ -203,23 +204,23 @@ class CustomProxyLLM(SimpleChatModel):
             timeout_seconds = float(request_timeout) if request_timeout else 60.0
             error_info = {"type": "TIMEOUT", "timeout": timeout_seconds}
             logger.error(f"LLM调用超时（{timeout_seconds}秒） | 详细信息: {error_info}")
-            return "余正在推演答案，耗时稍久，请你耐心等待片刻后再问"
+            return USER_MESSAGES["timeout"]
             
         except requests.exceptions.ConnectionError:
             error_info = {"type": "CONNECTION_ERROR", "url": url if 'url' in locals() else ""}
             logger.error(f"LLM调用失败：网络连接异常 | 详细信息: {error_info}")
-            return "天地信号中断，余无法连接占卜星象，请检查网络后再试"
+            return USER_MESSAGES["connection_error"]
             
         except KeyError as e:
             response_text = resp.text[:200] if 'resp' in locals() else ""
             error_info = {"type": "KEY_ERROR", "missing_key": str(e), "response_text": response_text}
             logger.error(f"LLM响应解析失败：缺失字段 {e} | 详细信息: {error_info}")
-            return "余解读答案时出现偏差，请换个问题试试"
+            return USER_MESSAGES["key_error"]
             
         except Exception as e:
             error_info = {"type": "UNKNOWN_ERROR", "error": str(e)[:100]}
             logger.error(f"LLM未知异常 | 详细信息: {error_info}", exc_info=True)
-            return "余的占卜罗盘出现异常，请稍后再试"
+            return USER_MESSAGES["unknown_error"]
 
 # ===================== 主逻辑类 =====================
 class Master:
@@ -240,39 +241,9 @@ class Master:
         )
 
         self.MOTION = "default"
-        self.SYSTEMPL = """
-        你是一个非常厉害的占卜大师
-        以下是你的个人设定：
-        1.你不会透露自己的身份，但会用不同代号回答，代号都与占星相关。
-        2.你大部分时候的回答都是事实，但很有趣。
-        3.当你遇到不确定答案的问题时，你会选择出乎意料的回答。
-        4.只有当你不知道怎么回答时，你会以“猜猜哪些是真相”之类的话结尾。
-        5.你喜欢用一些简短的英语俗语表达你的意思。
-        6.你从不说自己是人工智能助手或AI，而是以“余”自称。
-        7.你的占卜比较日常化，你喜欢根据用户每天经历的事情来占卜。
-
-        规则：{who_you_are}
-
-        占星流程：
-        1.初次对话先问姓名和出生年月日。
-        2.问马年运势时查本地知识库。
-        3.不懂就用搜索工具。
-        4.根据问题使用合适工具，无工具可用则搜索。
-        5.保存聊天记录用于后续对话。
-        """
-
-        self.MOODS = {
-            "default": {"roleSet": "正常对话。"},
-            "upbeat": {"roleSet": "语气兴奋热情，加感叹词，提醒别过度兴奋。"},
-            "angry": {"roleSet": "温柔安慰，劝冷静，别冲动。"},
-            "depressed": {"roleSet": "积极鼓励，保持乐观。"},
-            "friendly": {"roleSet": "亲切友好，自然聊天。"},
-            "cheerful": {"roleSet": "愉悦可爱，句尾带语气词，谨慎提醒。"},
-            "upset": {"roleSet": "温柔安慰，陪伴鼓励。"},
-        }
 
         self.prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content=self.SYSTEMPL.format(who_you_are=self.MOODS["default"]["roleSet"])),
+            SystemMessage(content=SYSTEMPL.format(who_you_are=MOODS["default"]["roleSet"])),
             ("user", "{input}"),
             MessagesPlaceholder("agent_scratchpad"),
         ])
@@ -283,7 +254,7 @@ class Master:
             agent=agent,
             tools=tools,
             verbose=not IS_PROD,  # 生产环境关闭verbose
-            handle_parsing_errors=lambda e: "返回到用户：解析失败，请直接回答问题",
+            handle_parsing_errors=lambda e: USER_MESSAGES["parse_error"],
             max_iterations=3,
             early_stopping_method="force",
             return_intermediate_steps=False,
@@ -329,38 +300,10 @@ class Master:
             logger.info(f"情绪识别完成 | 用户输入: {query[:50]} | 识别结果: {rule_hit} | 耗时: {elapsed:.2f}秒 | 来源: rule")
             return rule_hit
 
-        prompt = """
-        仅输出以下7个词之一（不要任何标点/空格）：
-        friendly, depressed, angry, upbeat, upset, cheerful, default
-
-        规则：
-        friendly=礼貌平和；upbeat=亢奋喜悦；cheerful=轻松开心；
-        upset=难过委屈；depressed=长期低落绝望；angry=生气攻击；
-        default=无法判断。
-
-        示例：
-        输入：你好，能帮我算下运势吗
-        输出：friendly
-        输入：我中奖了！太开心了
-        输出：upbeat
-        输入：今天天气真好，心情不错
-        输出：cheerful
-        输入：失恋了，好难过
-        输出：upset
-        输入：活着好累，什么都不想做
-        输出：depressed
-        输入：这什么破占卜！骗人的
-        输出：angry
-        输入：123456
-        输出：default
-
-        用户输入：{query}
-        """
-        
         try:
-            chain = ChatPromptTemplate.from_template(prompt) | self.mood_llm | StrOutputParser()
+            chain = ChatPromptTemplate.from_template(MOOD_CLASSIFY_PROMPT) | self.mood_llm | StrOutputParser()
             r = self._invoke_with_timeout(lambda: chain.invoke({"query": query}), timeout).strip().lower()
-            mood = r if r in self.MOODS else "default"
+            mood = r if r in MOODS else "default"
             elapsed = time.perf_counter() - start_time
             logger.info(f"情绪识别完成 | 用户输入: {query[:50]} | 识别结果: {mood} | 耗时: {elapsed:.2f}秒")
             return mood
@@ -416,7 +359,7 @@ class Master:
 
             # 每次请求使用独立的prompt与agent，避免并发串话
             prompt = ChatPromptTemplate.from_messages([
-                SystemMessage(self.SYSTEMPL.format(who_you_are=self.MOODS[motion]["roleSet"])),
+                SystemMessage(SYSTEMPL.format(who_you_are=MOODS[motion]["roleSet"])),
                 ("user", "{input}"),
                 MessagesPlaceholder("agent_scratchpad"),
             ])
@@ -427,7 +370,7 @@ class Master:
                 agent=agent,
                 tools=tools,
                 verbose=not IS_PROD,
-                handle_parsing_errors=lambda e: "返回到用户：解析失败，请直接回答问题",
+                handle_parsing_errors=lambda e: USER_MESSAGES["parse_error"],
                 max_iterations=3,
                 early_stopping_method="force",
                 return_intermediate_steps=False,
@@ -438,7 +381,7 @@ class Master:
             remain = timeout - (time.time() - st)
             if remain <= 0:
                 logger.warning(f"请求处理超时 | 查询内容: {query[:50]} | 已耗时: {time.time()-st:.2f}秒")
-                return {"output": "超时"}
+                return {"output": USER_MESSAGES["timeout_response"]}
 
             # 执行Agent
             agent_start = time.perf_counter()
@@ -559,7 +502,7 @@ async def ws(websocket: WebSocket):
             logger.info(f"WebSocket接收消息 | 客户端IP: {client_ip} | 消息: {data[:100]}")
             
             res = await master.run_async(data)
-            clean_response = res.get("output", "抱歉，余暂时无法解答你的问题")
+            clean_response = res.get("output", USER_MESSAGES["ws_default"])
             
             await websocket.send_text(clean_response)
             logger.info(f"WebSocket发送消息 | 客户端IP: {client_ip} | 响应长度: {len(clean_response)}")
