@@ -13,6 +13,9 @@ from langchain_core.language_models import SimpleChatModel
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain.schema import StrOutputParser
 
+# 线程本地上下文：为LLM请求传递每次调用的超时
+_thread_ctx = threading.local()
+
 # ===================== 日志规范化配置 =====================
 # 加载环境变量
 load_dotenv()
@@ -103,6 +106,7 @@ class CustomProxyLLM(SimpleChatModel):
     ) -> str:
         # 参数校验
         try:
+            call_start = time.perf_counter()
             if not self.api_key:
                 error_msg = "模型密钥未配置"
                 logger.error(f"LLM配置错误: {error_msg}")
@@ -148,7 +152,13 @@ class CustomProxyLLM(SimpleChatModel):
                 logger.debug(f"LLM请求URL: {url}")
                 logger.debug(f"LLM请求体: {data}")
 
-            resp = requests.post(url, headers=headers, json=data, timeout=60)
+            request_timeout = getattr(_thread_ctx, "request_timeout", None)
+            timeout_seconds = float(request_timeout) if request_timeout else 60.0
+            # 最小超时保护，避免传入0或负数导致立即失败
+            if timeout_seconds <= 0:
+                timeout_seconds = 1.0
+
+            resp = requests.post(url, headers=headers, json=data, timeout=timeout_seconds)
             resp.raise_for_status()
             
             if not IS_PROD:
@@ -157,7 +167,8 @@ class CustomProxyLLM(SimpleChatModel):
 
             result = resp.json()
             content = result["choices"][0]["message"]["content"].strip()
-            logger.info(f"LLM调用成功，响应长度: {len(content)}")
+            elapsed = time.perf_counter() - call_start
+            logger.info(f"LLM调用成功，响应长度: {len(content)} | 耗时: {elapsed:.2f}秒")
             return content
 
         except requests.exceptions.HTTPError as e:
@@ -188,8 +199,10 @@ class CustomProxyLLM(SimpleChatModel):
             return user_msg
             
         except requests.exceptions.Timeout:
-            error_info = {"type": "TIMEOUT", "timeout": 60}
-            logger.error(f"LLM调用超时（60秒） | 详细信息: {error_info}")
+            request_timeout = getattr(_thread_ctx, "request_timeout", None)
+            timeout_seconds = float(request_timeout) if request_timeout else 60.0
+            error_info = {"type": "TIMEOUT", "timeout": timeout_seconds}
+            logger.error(f"LLM调用超时（{timeout_seconds}秒） | 详细信息: {error_info}")
             return "余正在推演答案，耗时稍久，请你耐心等待片刻后再问"
             
         except requests.exceptions.ConnectionError:
@@ -286,10 +299,14 @@ class Master:
         def run():
             nonlocal res, exc
             try:
+                _thread_ctx.request_timeout = timeout
                 res = func()
             except Exception as e:
                 exc = e
                 logger.error(f"超时调用函数执行异常: {str(e)[:100]}", exc_info=True)
+            finally:
+                if hasattr(_thread_ctx, "request_timeout"):
+                    delattr(_thread_ctx, "request_timeout")
 
         t = threading.Thread(target=run)
         t.daemon = True
@@ -305,22 +322,16 @@ class Master:
 
     def mood_chain(self, query: str, timeout=5):
         """情绪识别链"""
+        start_time = time.perf_counter()
         prompt = """
-        # 任务要求
-        1. 仅从以下固定词表中选择1个词输出，严格匹配，不许添加任何其他文字、标点、空格：
-           friendly, depressed, angry, upbeat, upset, cheerful, default
-        
-        2. 必须按照下方“情绪判定规则”和“示例”执行，禁止主观臆断。
-        # 情绪判定规则（优先级：场景匹配 > 语气 > 关键词）
-        - friendly（友好）：用户输入语气平和、礼貌，无明显情绪倾向，仅正常提问/聊天（如：“你好，能帮我算下运势吗？”“请问怎么占卜？”）
-        - upbeat（兴奋）：用户输入充满激情、喜悦，有明显积极亢奋情绪（如：“我中奖了！太开心了🥳”“终于升职了，超激动！”）
-        - cheerful（开心）：用户输入轻松愉悦、心情好，无亢奋但积极（如：“今天天气真好，心情不错～”“吃到了喜欢的蛋糕，超满足”）
-        - upset（难过）：用户输入表达悲伤、委屈，情绪消极但无攻击性（如：“失恋了，好难过😢”“丢了钱包，心情好差”）
-        - depressed（压抑）：用户输入表达绝望、低落，长期负面情绪（如：“活着好累，什么都不想做”“每天都很压抑，没动力”）
-        - angry（愤怒）：用户输入含辱骂、抱怨、攻击性语言，或明显生气（如：“这什么破占卜！骗人的！”“气死我了，再也不信了！”）
-        - default（中性）：无法归类到以上6种情绪的情况（如：无意义字符、纯数字、中性陈述、模糊输入）
+        仅输出以下7个词之一（不要任何标点/空格）：
+        friendly, depressed, angry, upbeat, upset, cheerful, default
 
-        # 待识别输入
+        规则：
+        friendly=礼貌平和；upbeat=亢奋喜悦；cheerful=轻松开心；
+        upset=难过委屈；depressed=长期低落绝望；angry=生气攻击；
+        default=无法判断。
+
         用户输入：{query}
         """
         
@@ -328,8 +339,13 @@ class Master:
             chain = ChatPromptTemplate.from_template(prompt) | self.mood_llm | StrOutputParser()
             r = self._invoke_with_timeout(lambda: chain.invoke({"query": query}), timeout).strip().lower()
             mood = r if r in self.MOODS else "default"
-            logger.info(f"情绪识别完成 | 用户输入: {query[:50]} | 识别结果: {mood}")
+            elapsed = time.perf_counter() - start_time
+            logger.info(f"情绪识别完成 | 用户输入: {query[:50]} | 识别结果: {mood} | 耗时: {elapsed:.2f}秒")
             return mood
+        except TimeoutError:
+            elapsed = time.perf_counter() - start_time
+            logger.warning(f"情绪识别超时 | 用户输入: {query[:50]} | 超时: {timeout}秒 | 已耗时: {elapsed:.2f}秒")
+            return "default"
         except Exception as e:
             logger.error(f"情绪识别异常 | 用户输入: {query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
             return "default"
@@ -341,20 +357,18 @@ class Master:
             logger.info(f"开始处理用户请求 | 查询内容: {query[:100]} | 超时时间: {timeout}秒")
             
             # 情绪识别
-            motion = self.mood_chain(query, timeout=10)
-            self.MOTION = motion
+            motion = self.mood_chain(query, timeout=3)
 
-            # 重建带情绪的prompt
-            self.prompt = ChatPromptTemplate.from_messages([
+            # 每次请求使用独立的prompt与agent，避免并发串话
+            prompt = ChatPromptTemplate.from_messages([
                 SystemMessage(self.SYSTEMPL.format(who_you_are=self.MOODS[motion]["roleSet"])),
                 ("user", "{input}"),
                 MessagesPlaceholder("agent_scratchpad"),
             ])
             
-            # 重建Agent
             tools = [test]
-            agent = create_openai_tools_agent(self.normal_llm, tools, self.prompt)
-            self.agent_executor = AgentExecutor(
+            agent = create_openai_tools_agent(self.normal_llm, tools, prompt)
+            agent_executor = AgentExecutor(
                 agent=agent,
                 tools=tools,
                 verbose=not IS_PROD,
@@ -372,10 +386,18 @@ class Master:
                 return {"output": "超时"}
 
             # 执行Agent
-            result = self._invoke_with_timeout(
-                lambda: self.agent_executor.invoke({"input": query}),
-                timeout=remain
-            )
+            agent_start = time.perf_counter()
+            try:
+                result = self._invoke_with_timeout(
+                    lambda: agent_executor.invoke({"input": query}),
+                    timeout=remain
+                )
+                agent_elapsed = time.perf_counter() - agent_start
+                logger.info(f"Agent调用完成 | 查询内容: {query[:50]} | 耗时: {agent_elapsed:.2f}秒")
+            except TimeoutError:
+                agent_elapsed = time.perf_counter() - agent_start
+                logger.warning(f"Agent调用超时 | 查询内容: {query[:50]} | 超时: {remain:.2f}秒 | 已耗时: {agent_elapsed:.2f}秒")
+                raise
             
             total_time = time.time() - st
             logger.info(f"请求处理完成 | 查询内容: {query[:50]} | 耗时: {total_time:.2f}秒")
@@ -397,7 +419,7 @@ class Master:
             logger.error(f"异步调用异常 | 查询内容: {query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
             return {"output": "服务异常，请稍后再试"}
 
-    async def check_llm_health(self) -> bool:
+    def check_llm_health(self) -> bool:
         """检查LLM健康状态"""
         try:
             test_prompt = "健康检查"
@@ -449,7 +471,10 @@ def add_texts():
 async def health_check():
     """健康检查接口"""
     try:
-        llm_status = "ok" if await master.check_llm_health() else "error"
+        import asyncio
+
+        llm_ok = await asyncio.to_thread(master.check_llm_health)
+        llm_status = "ok" if llm_ok else "error"
         health_info = {
             "status": "healthy",
             "timestamp": time.time(),
