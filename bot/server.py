@@ -235,8 +235,8 @@ class Master:
             api_key=os.getenv("OPENAI_API_KEY", ""),
             base_url=os.getenv("OPENAI_API_BASE", ""),
             model=os.getenv("OPENAI_MODEL", ""),
-            temperature=0.1,
-            max_tokens=100
+            temperature=0.0,
+            max_tokens=12
         )
 
         self.MOTION = "default"
@@ -323,6 +323,12 @@ class Master:
     def mood_chain(self, query: str, timeout=5):
         """情绪识别链"""
         start_time = time.perf_counter()
+        rule_hit = self._rule_based_mood(query)
+        if rule_hit:
+            elapsed = time.perf_counter() - start_time
+            logger.info(f"情绪识别完成 | 用户输入: {query[:50]} | 识别结果: {rule_hit} | 耗时: {elapsed:.2f}秒 | 来源: rule")
+            return rule_hit
+
         prompt = """
         仅输出以下7个词之一（不要任何标点/空格）：
         friendly, depressed, angry, upbeat, upset, cheerful, default
@@ -331,6 +337,22 @@ class Master:
         friendly=礼貌平和；upbeat=亢奋喜悦；cheerful=轻松开心；
         upset=难过委屈；depressed=长期低落绝望；angry=生气攻击；
         default=无法判断。
+
+        示例：
+        输入：你好，能帮我算下运势吗
+        输出：friendly
+        输入：我中奖了！太开心了
+        输出：upbeat
+        输入：今天天气真好，心情不错
+        输出：cheerful
+        输入：失恋了，好难过
+        输出：upset
+        输入：活着好累，什么都不想做
+        输出：depressed
+        输入：这什么破占卜！骗人的
+        输出：angry
+        输入：123456
+        输出：default
 
         用户输入：{query}
         """
@@ -349,6 +371,39 @@ class Master:
         except Exception as e:
             logger.error(f"情绪识别异常 | 用户输入: {query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
             return "default"
+
+    def _rule_based_mood(self, query: str) -> str | None:
+        """规则优先：命中强情绪关键词则直接返回"""
+        text = (query or "").strip().lower()
+        if not text:
+            return "default"
+
+        angry_words = ["气死", "生气", "愤怒", "垃圾", "骗子", "滚", "破", "怒", "不爽"]
+        depressed_words = ["绝望", "活着好累", "想死", "抑郁", "没动力", "无助", "崩溃"]
+        upset_words = ["难过", "委屈", "伤心", "失恋", "心情差", "沮丧"]
+        upbeat_words = ["太开心", "中奖了", "超激动", "好兴奋", "太棒了", "好爽"]
+        cheerful_words = ["心情不错", "挺开心", "很愉快", "好满足", "天气真好"]
+
+        for w in angry_words:
+            if w in text:
+                return "angry"
+        for w in depressed_words:
+            if w in text:
+                return "depressed"
+        for w in upset_words:
+            if w in text:
+                return "upset"
+        for w in upbeat_words:
+            if w in text:
+                return "upbeat"
+        for w in cheerful_words:
+            if w in text:
+                return "cheerful"
+
+        if text in ["你好", "您好", "在吗", "谢谢", "麻烦了"]:
+            return "friendly"
+
+        return None
 
     def run(self, query, timeout=60):
         """主运行方法"""
