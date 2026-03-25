@@ -4,14 +4,18 @@ import logging
 import logging.handlers
 import requests
 import threading
-from typing import Dict, Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from langchain.agents import create_openai_tools_agent, AgentExecutor, tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.language_models import SimpleChatModel
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain.schema import StrOutputParser
+from langchain_community.utilities import SerpAPIWrapper
+from langchain_community.vectorstores import Qdrant
+from qdrant_client import QdrantClient
+from langchain_openai import OpenAIEmbeddings
 from texts import SYSTEMPL, MOODS, MOOD_CLASSIFY_PROMPT, USER_MESSAGES
 
 # 线程本地上下文：为LLM请求传递每次调用的超时
@@ -87,8 +91,30 @@ def test():
     logger.info("执行测试工具")
     return "test"
 
+@tool
+def search(query: str) -> str:
+    """搜索工具:只有当你需要获取最新信息或者查询事实时才使用这个工具。"""
+    serp = SerpAPIWrapper()
+    result = serp.run(query)
+    logger.info(f"执行搜索工具 | 查询: {query[:50]} | 结果: {result[:100]}")
+    return result
+
+@tool
+def vector_search(query: str) -> str:
+    """向量搜索工具:只有当你需要从已知文档中查询信息时才使用这个工具。"""
+    client = Qdrant(
+        QdrantClient(path = "./qdrant_data/qdrant.db"),
+        "divination_master_collection",
+        OpenAIEmbeddings(),
+    )
+    retriever = client.as_retriever(search_type="mmr")
+    docs = retriever.get_relevant_documents(query)
+    result = "\n\n".join([doc.page_content for doc in docs])
+    logger.info(f"执行向量搜索工具 | 查询: {query[:50]} | 结果长度: {len(result)}")
+    return result
+
 # ===================== 自定义LLM =====================
-class CustomProxyLLM(SimpleChatModel):
+class CustomProxyLLM(BaseChatModel):
     api_key: str
     base_url: str
     model: str
@@ -99,11 +125,64 @@ class CustomProxyLLM(SimpleChatModel):
     def _llm_type(self) -> str:
         return "baishan"
 
-    def _call(
+    def __getstate__(self):
+        """避免运行时对象被误序列化，导致多进程/拷贝路径下出现锁相关错误。"""
+        raise TypeError("CustomProxyLLM is a runtime object and cannot be pickled")
+
+    @staticmethod
+    def _to_proxy_role(message: BaseMessage) -> str:
+        """将LangChain消息类型映射到OpenAI兼容角色。"""
+        role_mapping = {
+            "human": "user",
+            "ai": "assistant",
+            "system": "system",
+            "tool": "tool",
+            "function": "tool",
+        }
+        role = role_mapping.get(message.type)
+        if role:
+            return role
+        # 兼容部分消息把role放在additional_kwargs里的情况
+        custom_role = getattr(message, "additional_kwargs", {}).get("role")
+        if custom_role in {"user", "assistant", "system", "tool"}:
+            return custom_role
+        return "user"
+
+    @staticmethod
+    def _extract_content(payload: dict) -> str:
+        """稳健提取模型回复文本。"""
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise KeyError("choices")
+
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            raise KeyError("message")
+
+        content = message.get("content")
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content.strip()
+
+        # 兼容content为分段结构（list[dict]）的响应
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "".join(parts).strip()
+
+        return str(content).strip()
+
+    def _request_completion(
         self,
         messages: list[BaseMessage],
         stop=None,
-        run_manager=None,** kwargs
+        run_manager=None,
+        **kwargs
     ) -> str:
         # 参数校验
         try:
@@ -127,15 +206,9 @@ class CustomProxyLLM(SimpleChatModel):
                 "User-Agent": "LangChain-CustomLLM/1.0"
             }
 
-            role_mapping = {
-                "human": "user",
-                "ai": "assistant",
-                "system": "system"
-            }
-
             proxy_messages = []
             for m in messages:
-                role = role_mapping.get(m.type, "user")
+                role = self._to_proxy_role(m)
                 proxy_messages.append({"role": role, "content": m.content})
 
             data = {
@@ -154,7 +227,10 @@ class CustomProxyLLM(SimpleChatModel):
                 logger.debug(f"LLM请求体: {data}")
 
             request_timeout = getattr(_thread_ctx, "request_timeout", None)
-            timeout_seconds = float(request_timeout) if request_timeout else 60.0
+            try:
+                timeout_seconds = float(request_timeout) if request_timeout is not None else 60.0
+            except (TypeError, ValueError):
+                timeout_seconds = 60.0
             # 最小超时保护，避免传入0或负数导致立即失败
             if timeout_seconds <= 0:
                 timeout_seconds = 1.0
@@ -167,7 +243,7 @@ class CustomProxyLLM(SimpleChatModel):
                 logger.debug(f"LLM响应内容: {resp.text[:500]}")
 
             result = resp.json()
-            content = result["choices"][0]["message"]["content"].strip()
+            content = self._extract_content(result)
             elapsed = time.perf_counter() - call_start
             logger.info(f"LLM调用成功，响应长度: {len(content)} | 耗时: {elapsed:.2f}秒")
             return content
@@ -201,7 +277,10 @@ class CustomProxyLLM(SimpleChatModel):
             
         except requests.exceptions.Timeout:
             request_timeout = getattr(_thread_ctx, "request_timeout", None)
-            timeout_seconds = float(request_timeout) if request_timeout else 60.0
+            try:
+                timeout_seconds = float(request_timeout) if request_timeout is not None else 60.0
+            except (TypeError, ValueError):
+                timeout_seconds = 60.0
             error_info = {"type": "TIMEOUT", "timeout": timeout_seconds}
             logger.error(f"LLM调用超时（{timeout_seconds}秒） | 详细信息: {error_info}")
             return USER_MESSAGES["timeout"]
@@ -221,6 +300,22 @@ class CustomProxyLLM(SimpleChatModel):
             error_info = {"type": "UNKNOWN_ERROR", "error": str(e)[:100]}
             logger.error(f"LLM未知异常 | 详细信息: {error_info}", exc_info=True)
             return USER_MESSAGES["unknown_error"]
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop=None,
+        run_manager=None,
+        **kwargs
+    ) -> ChatResult:
+        content = self._request_completion(
+            messages=messages,
+            stop=stop,
+            run_manager=run_manager,
+            **kwargs,
+        )
+        generation = ChatGeneration(message=AIMessage(content=content))
+        return ChatResult(generations=[generation])
 
 # ===================== 主逻辑类 =====================
 class Master:
@@ -248,8 +343,14 @@ class Master:
             MessagesPlaceholder("agent_scratchpad"),
         ])
 
-        tools = [test]
-        agent = create_openai_tools_agent(self.normal_llm, tools, self.prompt)
+        self.memory = ""  # 后续可替换为真正的内存模块
+        tools = [search,test]
+        agent = create_openai_tools_agent(
+            self.normal_llm, 
+            tools, 
+            self.prompt
+        )
+        
         self.agent_executor = AgentExecutor(
             agent=agent,
             tools=tools,
@@ -364,7 +465,7 @@ class Master:
                 MessagesPlaceholder("agent_scratchpad"),
             ])
             
-            tools = [test]
+            tools = [search,test]
             agent = create_openai_tools_agent(self.normal_llm, tools, prompt)
             agent_executor = AgentExecutor(
                 agent=agent,
@@ -422,7 +523,27 @@ class Master:
         try:
             test_prompt = "健康检查"
             response = self.normal_llm.invoke(test_prompt)
-            logger.info(f"LLM健康检查通过 | 响应: {response[:50]}")
+
+            if isinstance(response, str):
+                preview = response
+            else:
+                content = getattr(response, "content", response)
+                if isinstance(content, str):
+                    preview = content
+                elif isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                text_parts.append(text)
+                        elif isinstance(item, str):
+                            text_parts.append(item)
+                    preview = "".join(text_parts)
+                else:
+                    preview = str(content)
+
+            logger.info(f"LLM健康检查通过 | 响应: {preview[:50]}")
             return True
         except Exception as e:
             logger.error(f"LLM健康检查失败 | 错误: {str(e)[:100]}", exc_info=True)
