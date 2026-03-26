@@ -4,6 +4,7 @@ import logging
 import logging.handlers
 import requests
 import threading
+from Mytools import *
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from langchain.agents import create_openai_tools_agent, AgentExecutor, tool
@@ -84,34 +85,6 @@ IS_PROD = os.getenv("ENV", "dev") == "prod"
 
 app = FastAPI()
 
-# ===================== 工具定义 =====================
-@tool
-def test():
-    """Test tool"""
-    logger.info("执行测试工具")
-    return "test"
-
-@tool
-def search(query: str) -> str:
-    """搜索工具:只有当你需要获取最新信息或者查询事实时才使用这个工具。"""
-    serp = SerpAPIWrapper()
-    result = serp.run(query)
-    logger.info(f"执行搜索工具 | 查询: {query[:50]} | 结果: {result[:100]}")
-    return result
-
-@tool
-def vector_search(query: str) -> str:
-    """向量搜索工具:只有当你需要从已知文档中查询信息时才使用这个工具。"""
-    client = Qdrant(
-        QdrantClient(path = "./qdrant_data/qdrant.db"),
-        "divination_master_collection",
-        OpenAIEmbeddings(),
-    )
-    retriever = client.as_retriever(search_type="mmr")
-    docs = retriever.get_relevant_documents(query)
-    result = "\n\n".join([doc.page_content for doc in docs])
-    logger.info(f"执行向量搜索工具 | 查询: {query[:50]} | 结果长度: {len(result)}")
-    return result
 
 # ===================== 自定义LLM =====================
 class CustomProxyLLM(BaseChatModel):
@@ -344,24 +317,74 @@ class Master:
         ])
 
         self.memory = ""  # 后续可替换为真正的内存模块
-        tools = [search,test]
-        agent = create_openai_tools_agent(
-            self.normal_llm, 
-            tools, 
-            self.prompt
-        )
-        
-        self.agent_executor = AgentExecutor(
-            agent=agent,
-            tools=tools,
-            verbose=not IS_PROD,  # 生产环境关闭verbose
-            handle_parsing_errors=lambda e: USER_MESSAGES["parse_error"],
-            max_iterations=3,
-            early_stopping_method="force",
-            return_intermediate_steps=False,
-            return_only_outputs=True,
-        )
+        self.all_tools = [
+            search,
+            test,
+            vector_search,
+            xingpan,
+            astro_my_sign,
+            astro_natal_chart,
+            astro_current_chart,
+            astro_transit_chart,
+        ]
+
         logger.info("Master实例初始化完成")
+
+    def _route_intent(self, query: str) -> str:
+        """基于关键词的轻量意图路由，减少误调用工具。"""
+        text = (query or "").strip().lower()
+        if not text:
+            return "default"
+
+        # 星座信息
+        if any(k in text for k in ["星座信息", "我的星座", "我是什么星座", "什么星座"]):
+            return "astro_my_sign"
+
+        # 本命盘
+        if any(k in text for k in ["本命盘", "出生盘", "星盘本命"]):
+            return "astro_natal_chart"
+
+        # 天象盘
+        if any(k in text for k in ["天象盘", "当前天象", "今日天象", "现在天象"]):
+            return "astro_current_chart"
+
+        # 行运盘
+        if any(k in text for k in ["行运盘", "流年盘", "推运", "transit"]):
+            return "astro_transit_chart"
+
+        # 通用星盘
+        if any(k in text for k in ["星盘", "占星", "看盘"]):
+            return "xingpan"
+
+        # 本地知识库
+        if any(k in text for k in ["马年", "知识库", "文档", "资料", "本地"]):
+            return "vector_search"
+
+        # 实时搜索
+        if any(k in text for k in ["最新", "新闻", "今天", "实时", "搜索", "查一下", "百科"]):
+            return "search"
+
+        return "default"
+
+    def _select_tools_by_intent(self, query: str):
+        """按意图动态裁剪工具集合。"""
+        intent = self._route_intent(query)
+        map_tools = {
+            "astro_my_sign": [astro_my_sign, test, search],
+            "astro_natal_chart": [astro_natal_chart, xingpan, test, search],
+            "astro_current_chart": [astro_current_chart, test, search],
+            "astro_transit_chart": [astro_transit_chart, xingpan, test, search],
+            "xingpan": [xingpan, astro_natal_chart, astro_transit_chart, test, search],
+            "vector_search": [vector_search, search, test],
+            "search": [search, vector_search, test],
+        }
+        selected = map_tools.get(intent, self.all_tools)
+        logger.info(
+            "工具路由完成 | intent: %s | tools: %s",
+            intent,
+            [getattr(t, "name", str(t)) for t in selected],
+        )
+        return selected
 
     def _invoke_with_timeout(self, func, timeout):
         """带超时的函数调用"""
@@ -465,7 +488,7 @@ class Master:
                 MessagesPlaceholder("agent_scratchpad"),
             ])
             
-            tools = [search,test]
+            tools = self._select_tools_by_intent(query)
             agent = create_openai_tools_agent(self.normal_llm, tools, prompt)
             agent_executor = AgentExecutor(
                 agent=agent,
