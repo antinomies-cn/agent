@@ -8,16 +8,12 @@ import threading
 from Mytools import *
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from langchain.agents import create_openai_tools_agent, AgentExecutor, tool
+from langchain.agents import create_openai_tools_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain.schema import StrOutputParser
-from langchain_community.utilities import SerpAPIWrapper
-from langchain_community.vectorstores import Qdrant
-from qdrant_client import QdrantClient
-from langchain_openai import OpenAIEmbeddings
 from texts import SYSTEMPL, MOODS, MOOD_CLASSIFY_PROMPT, USER_MESSAGES
 
 # 线程本地上下文：为LLM请求传递每次调用的超时
@@ -179,6 +175,23 @@ class CustomProxyLLM(BaseChatModel):
             valid_calls.append(call)
         return valid_calls
 
+    @staticmethod
+    def _resolve_timeout_seconds(default_timeout: float = 60.0) -> float:
+        """根据线程上下文计算本次请求超时，包含deadline裁剪与最小值保护。"""
+        request_timeout = getattr(_thread_ctx, "request_timeout", None)
+        request_deadline = getattr(_thread_ctx, "request_deadline", None)
+
+        try:
+            timeout_seconds = float(request_timeout) if request_timeout is not None else default_timeout
+        except (TypeError, ValueError):
+            timeout_seconds = default_timeout
+
+        if request_deadline is not None:
+            remaining_budget = request_deadline - time.perf_counter()
+            timeout_seconds = min(timeout_seconds, remaining_budget)
+
+        return max(timeout_seconds, 1.0)
+
     def _request_completion(
         self,
         messages: list[BaseMessage],
@@ -189,18 +202,15 @@ class CustomProxyLLM(BaseChatModel):
         # 参数校验
         try:
             call_start = time.perf_counter()
-            if not self.api_key:
-                error_msg = "模型密钥未配置"
-                logger.error(f"LLM配置错误: {error_msg}")
-                return USER_MESSAGES["config"]["api_key"], []
-            if not self.base_url:
-                error_msg = "模型接口地址未配置"
-                logger.error(f"LLM配置错误: {error_msg}")
-                return USER_MESSAGES["config"]["base_url"], []
-            if not self.model:
-                error_msg = "模型名称未配置"
-                logger.error(f"LLM配置错误: {error_msg}")
-                return USER_MESSAGES["config"]["model"], []
+            required_config = [
+                ("api_key", self.api_key, "模型密钥未配置"),
+                ("base_url", self.base_url, "模型接口地址未配置"),
+                ("model", self.model, "模型名称未配置"),
+            ]
+            for config_key, config_value, error_msg in required_config:
+                if not config_value:
+                    logger.error(f"LLM配置错误: {error_msg}")
+                    return USER_MESSAGES["config"][config_key], []
 
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
@@ -252,19 +262,7 @@ class CustomProxyLLM(BaseChatModel):
                 logger.debug(f"LLM请求URL: {url}")
                 logger.debug(f"LLM请求体: {data}")
 
-            request_timeout = getattr(_thread_ctx, "request_timeout", None)
-            request_deadline = getattr(_thread_ctx, "request_deadline", None)
-            try:
-                timeout_seconds = float(request_timeout) if request_timeout is not None else 60.0
-            except (TypeError, ValueError):
-                timeout_seconds = 60.0
-            # 若存在总请求deadline，则每次LLM调用都按剩余预算裁剪，避免累计超时。
-            if request_deadline is not None:
-                remaining_budget = request_deadline - time.perf_counter()
-                timeout_seconds = min(timeout_seconds, remaining_budget)
-            # 最小超时保护，避免传入0或负数导致立即失败
-            if timeout_seconds <= 0:
-                timeout_seconds = 1.0
+            timeout_seconds = self._resolve_timeout_seconds()
 
             # 对网关瞬时失败做短重试，降低偶发500对用户的影响。
             try:
@@ -345,11 +343,7 @@ class CustomProxyLLM(BaseChatModel):
             return user_msg, []
             
         except requests.exceptions.Timeout:
-            request_timeout = getattr(_thread_ctx, "request_timeout", None)
-            try:
-                timeout_seconds = float(request_timeout) if request_timeout is not None else 60.0
-            except (TypeError, ValueError):
-                timeout_seconds = 60.0
+            timeout_seconds = self._resolve_timeout_seconds()
             error_info = {"type": "TIMEOUT", "timeout": timeout_seconds}
             logger.error(f"LLM调用超时（{timeout_seconds}秒） | 详细信息: {error_info}")
             return USER_MESSAGES["timeout"], []
@@ -404,16 +398,6 @@ class Master:
             temperature=0.0,
             max_tokens=12
         )
-
-        self.MOTION = "default"
-
-        self.prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content=SYSTEMPL.format(who_you_are=MOODS["default"]["roleSet"])),
-            ("user", "{input}"),
-            MessagesPlaceholder("agent_scratchpad"),
-        ])
-
-        self.memory = ""  # 后续可替换为真正的内存模块
         self.all_tools = [
             search,
             test,
@@ -427,41 +411,30 @@ class Master:
 
         logger.info("Master实例初始化完成")
 
+    @staticmethod
+    def _match_keywords(text: str, mapping: list[tuple[str, list[str]]], default: str) -> str:
+        """按顺序匹配关键词并返回首个命中的标签。"""
+        for label, keywords in mapping:
+            if any(k in text for k in keywords):
+                return label
+        return default
+
     def _route_intent(self, query: str) -> str:
         """基于关键词的轻量意图路由，减少误调用工具。"""
         text = (query or "").strip().lower()
         if not text:
             return "default"
 
-        # 星座信息
-        if any(k in text for k in ["星座信息", "我的星座", "我是什么星座", "什么星座"]):
-            return "astro_my_sign"
-
-        # 本命盘
-        if any(k in text for k in ["本命盘", "出生盘", "星盘本命"]):
-            return "astro_natal_chart"
-
-        # 天象盘
-        if any(k in text for k in ["天象盘", "当前天象", "今日天象", "现在天象"]):
-            return "astro_current_chart"
-
-        # 行运盘
-        if any(k in text for k in ["行运盘", "流年盘", "推运", "transit"]):
-            return "astro_transit_chart"
-
-        # 通用星盘
-        if any(k in text for k in ["星盘", "占星", "看盘"]):
-            return "xingpan"
-
-        # 本地知识库
-        if any(k in text for k in ["马年", "知识库", "文档", "资料", "本地"]):
-            return "vector_search"
-
-        # 实时搜索
-        if any(k in text for k in ["最新", "新闻", "今天", "实时", "搜索", "查一下", "百科"]):
-            return "search"
-
-        return "default"
+        intent_mapping = [
+            ("astro_my_sign", ["星座信息", "我的星座", "我是什么星座", "什么星座"]),
+            ("astro_natal_chart", ["本命盘", "出生盘", "星盘本命"]),
+            ("astro_current_chart", ["天象盘", "当前天象", "今日天象", "现在天象"]),
+            ("astro_transit_chart", ["行运盘", "流年盘", "推运", "transit"]),
+            ("xingpan", ["星盘", "占星", "看盘"]),
+            ("vector_search", ["马年", "知识库", "文档", "资料", "本地"]),
+            ("search", ["最新", "新闻", "今天", "实时", "搜索", "查一下", "百科"]),
+        ]
+        return self._match_keywords(text, intent_mapping, "default")
 
     def _select_tools_by_intent(self, query: str, intent: str | None = None):
         """按意图动态裁剪工具集合。"""
@@ -602,27 +575,16 @@ class Master:
         if not text:
             return "default"
 
-        angry_words = ["气死", "生气", "愤怒", "垃圾", "骗子", "滚", "破", "怒", "不爽"]
-        depressed_words = ["绝望", "活着好累", "想死", "抑郁", "没动力", "无助", "崩溃"]
-        upset_words = ["难过", "委屈", "伤心", "失恋", "心情差", "沮丧"]
-        upbeat_words = ["太开心", "中奖了", "超激动", "好兴奋", "太棒了", "好爽"]
-        cheerful_words = ["心情不错", "挺开心", "很愉快", "好满足", "天气真好"]
-
-        for w in angry_words:
-            if w in text:
-                return "angry"
-        for w in depressed_words:
-            if w in text:
-                return "depressed"
-        for w in upset_words:
-            if w in text:
-                return "upset"
-        for w in upbeat_words:
-            if w in text:
-                return "upbeat"
-        for w in cheerful_words:
-            if w in text:
-                return "cheerful"
+        mood_mapping = [
+            ("angry", ["气死", "生气", "愤怒", "垃圾", "骗子", "滚", "破", "怒", "不爽"]),
+            ("depressed", ["绝望", "活着好累", "想死", "抑郁", "没动力", "无助", "崩溃"]),
+            ("upset", ["难过", "委屈", "伤心", "失恋", "心情差", "沮丧"]),
+            ("upbeat", ["太开心", "中奖了", "超激动", "好兴奋", "太棒了", "好爽"]),
+            ("cheerful", ["心情不错", "挺开心", "很愉快", "好满足", "天气真好"]),
+        ]
+        mood = self._match_keywords(text, mood_mapping, "")
+        if mood:
+            return mood
 
         if text in ["你好", "您好", "在吗", "谢谢", "麻烦了"]:
             return "friendly"
@@ -744,30 +706,35 @@ class Master:
             logger.error(f"异步调用异常 | 查询内容: {query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
             return {"output": "服务异常，请稍后再试"}
 
+    @staticmethod
+    def _extract_preview_text(response) -> str:
+        """提取健康检查响应预览文本。"""
+        if isinstance(response, str):
+            return response
+
+        content = getattr(response, "content", response)
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "".join(parts)
+
+        return str(content)
+
     def check_llm_health(self) -> bool:
         """检查LLM健康状态"""
         try:
             test_prompt = "健康检查"
             response = self.normal_llm.invoke(test_prompt)
-
-            if isinstance(response, str):
-                preview = response
-            else:
-                content = getattr(response, "content", response)
-                if isinstance(content, str):
-                    preview = content
-                elif isinstance(content, list):
-                    text_parts = []
-                    for item in content:
-                        if isinstance(item, dict):
-                            text = item.get("text")
-                            if isinstance(text, str):
-                                text_parts.append(text)
-                        elif isinstance(item, str):
-                            text_parts.append(item)
-                    preview = "".join(text_parts)
-                else:
-                    preview = str(content)
+            preview = self._extract_preview_text(response)
 
             logger.info(f"LLM健康检查通过 | 响应: {preview[:50]}")
             return True
