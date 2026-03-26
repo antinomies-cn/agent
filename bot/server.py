@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 import logging.handlers
 import requests
@@ -150,28 +151,56 @@ class CustomProxyLLM(BaseChatModel):
 
         return str(content).strip()
 
+    @staticmethod
+    def _extract_tool_calls(payload: dict) -> list[dict]:
+        """提取OpenAI兼容响应中的tool_calls。"""
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return []
+
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            return []
+
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return []
+
+        # 只保留结构正确的条目，避免脏数据影响Agent解析
+        valid_calls = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function")
+            if not isinstance(fn, dict):
+                continue
+            if not isinstance(fn.get("name"), str):
+                continue
+            valid_calls.append(call)
+        return valid_calls
+
     def _request_completion(
         self,
         messages: list[BaseMessage],
         stop=None,
         run_manager=None,
         **kwargs
-    ) -> str:
+    ) -> tuple[str, list[dict]]:
         # 参数校验
         try:
             call_start = time.perf_counter()
             if not self.api_key:
                 error_msg = "模型密钥未配置"
                 logger.error(f"LLM配置错误: {error_msg}")
-                return USER_MESSAGES["config"]["api_key"]
+                return USER_MESSAGES["config"]["api_key"], []
             if not self.base_url:
                 error_msg = "模型接口地址未配置"
                 logger.error(f"LLM配置错误: {error_msg}")
-                return USER_MESSAGES["config"]["base_url"]
+                return USER_MESSAGES["config"]["base_url"], []
             if not self.model:
                 error_msg = "模型名称未配置"
                 logger.error(f"LLM配置错误: {error_msg}")
-                return USER_MESSAGES["config"]["model"]
+                return USER_MESSAGES["config"]["model"], []
 
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
@@ -182,7 +211,23 @@ class CustomProxyLLM(BaseChatModel):
             proxy_messages = []
             for m in messages:
                 role = self._to_proxy_role(m)
-                proxy_messages.append({"role": role, "content": m.content})
+                msg = {"role": role, "content": m.content}
+
+                # assistant 消息若包含工具调用，必须透传 tool_calls。
+                if role == "assistant":
+                    assistant_tool_calls = getattr(m, "additional_kwargs", {}).get("tool_calls")
+                    if isinstance(assistant_tool_calls, list) and assistant_tool_calls:
+                        msg["tool_calls"] = assistant_tool_calls
+
+                # tool 消息必须携带 tool_call_id，对齐上一个 assistant.tool_calls。
+                if role == "tool":
+                    tool_call_id = getattr(m, "tool_call_id", None)
+                    if not tool_call_id:
+                        tool_call_id = getattr(m, "additional_kwargs", {}).get("tool_call_id")
+                    if tool_call_id:
+                        msg["tool_call_id"] = tool_call_id
+
+                proxy_messages.append(msg)
 
             data = {
                 "model": self.model,
@@ -192,6 +237,14 @@ class CustomProxyLLM(BaseChatModel):
                 "stream": False
             }
 
+            # 透传工具调用相关字段，否则Agent永远拿不到tool schema。
+            for key in ["tools", "tool_choice", "parallel_tool_calls", "response_format"]:
+                value = kwargs.get(key)
+                if value is not None:
+                    data[key] = value
+            if stop:
+                data["stop"] = stop
+
             url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
             
             # 开发环境打印调试信息
@@ -200,16 +253,53 @@ class CustomProxyLLM(BaseChatModel):
                 logger.debug(f"LLM请求体: {data}")
 
             request_timeout = getattr(_thread_ctx, "request_timeout", None)
+            request_deadline = getattr(_thread_ctx, "request_deadline", None)
             try:
                 timeout_seconds = float(request_timeout) if request_timeout is not None else 60.0
             except (TypeError, ValueError):
                 timeout_seconds = 60.0
+            # 若存在总请求deadline，则每次LLM调用都按剩余预算裁剪，避免累计超时。
+            if request_deadline is not None:
+                remaining_budget = request_deadline - time.perf_counter()
+                timeout_seconds = min(timeout_seconds, remaining_budget)
             # 最小超时保护，避免传入0或负数导致立即失败
             if timeout_seconds <= 0:
                 timeout_seconds = 1.0
 
-            resp = requests.post(url, headers=headers, json=data, timeout=timeout_seconds)
-            resp.raise_for_status()
+            # 对网关瞬时失败做短重试，降低偶发500对用户的影响。
+            try:
+                max_retries = int(os.getenv("LLM_RETRY_COUNT", "1"))
+            except ValueError:
+                max_retries = 1
+            max_retries = max(0, max_retries)
+            retry_status_codes = {429, 500, 502, 503, 504}
+
+            last_http_error = None
+            resp = None
+            for attempt in range(max_retries + 1):
+                try:
+                    resp = requests.post(url, headers=headers, json=data, timeout=timeout_seconds)
+                    resp.raise_for_status()
+                    break
+                except requests.exceptions.HTTPError as e:
+                    last_http_error = e
+                    status_code = e.response.status_code if e.response is not None else 0
+                    should_retry = status_code in retry_status_codes and attempt < max_retries
+                    if not should_retry:
+                        raise
+
+                    sleep_seconds = min(1.5, 0.3 * (attempt + 1))
+                    logger.warning(
+                        "LLM调用触发重试 | attempt: %s/%s | status: %s | backoff: %.1fs",
+                        attempt + 1,
+                        max_retries + 1,
+                        status_code,
+                        sleep_seconds,
+                    )
+                    time.sleep(sleep_seconds)
+
+            if last_http_error is not None and resp is None:
+                raise last_http_error
             
             if not IS_PROD:
                 logger.debug(f"LLM响应状态码: {resp.status_code}")
@@ -217,9 +307,15 @@ class CustomProxyLLM(BaseChatModel):
 
             result = resp.json()
             content = self._extract_content(result)
+            tool_calls = self._extract_tool_calls(result)
             elapsed = time.perf_counter() - call_start
-            logger.info(f"LLM调用成功，响应长度: {len(content)} | 耗时: {elapsed:.2f}秒")
-            return content
+            logger.info(
+                "LLM调用成功，响应长度: %s | tool_calls: %s | 耗时: %.2f秒",
+                len(content),
+                len(tool_calls),
+                elapsed,
+            )
+            return content, tool_calls
 
         except requests.exceptions.HTTPError as e:
             status_code = resp.status_code if 'resp' in locals() else 0
@@ -246,7 +342,7 @@ class CustomProxyLLM(BaseChatModel):
                 user_msg = USER_MESSAGES["http"]["default"]
             
             logger.error(f"{error_log} | 详细信息: {error_info}")
-            return user_msg
+            return user_msg, []
             
         except requests.exceptions.Timeout:
             request_timeout = getattr(_thread_ctx, "request_timeout", None)
@@ -256,23 +352,23 @@ class CustomProxyLLM(BaseChatModel):
                 timeout_seconds = 60.0
             error_info = {"type": "TIMEOUT", "timeout": timeout_seconds}
             logger.error(f"LLM调用超时（{timeout_seconds}秒） | 详细信息: {error_info}")
-            return USER_MESSAGES["timeout"]
+            return USER_MESSAGES["timeout"], []
             
         except requests.exceptions.ConnectionError:
             error_info = {"type": "CONNECTION_ERROR", "url": url if 'url' in locals() else ""}
             logger.error(f"LLM调用失败：网络连接异常 | 详细信息: {error_info}")
-            return USER_MESSAGES["connection_error"]
+            return USER_MESSAGES["connection_error"], []
             
         except KeyError as e:
             response_text = resp.text[:200] if 'resp' in locals() else ""
             error_info = {"type": "KEY_ERROR", "missing_key": str(e), "response_text": response_text}
             logger.error(f"LLM响应解析失败：缺失字段 {e} | 详细信息: {error_info}")
-            return USER_MESSAGES["key_error"]
+            return USER_MESSAGES["key_error"], []
             
         except Exception as e:
             error_info = {"type": "UNKNOWN_ERROR", "error": str(e)[:100]}
             logger.error(f"LLM未知异常 | 详细信息: {error_info}", exc_info=True)
-            return USER_MESSAGES["unknown_error"]
+            return USER_MESSAGES["unknown_error"], []
 
     def _generate(
         self,
@@ -281,13 +377,14 @@ class CustomProxyLLM(BaseChatModel):
         run_manager=None,
         **kwargs
     ) -> ChatResult:
-        content = self._request_completion(
+        content, tool_calls = self._request_completion(
             messages=messages,
             stop=stop,
             run_manager=run_manager,
             **kwargs,
         )
-        generation = ChatGeneration(message=AIMessage(content=content))
+        additional_kwargs = {"tool_calls": tool_calls} if tool_calls else {}
+        generation = ChatGeneration(message=AIMessage(content=content, additional_kwargs=additional_kwargs))
         return ChatResult(generations=[generation])
 
 # ===================== 主逻辑类 =====================
@@ -366,9 +463,9 @@ class Master:
 
         return "default"
 
-    def _select_tools_by_intent(self, query: str):
+    def _select_tools_by_intent(self, query: str, intent: str | None = None):
         """按意图动态裁剪工具集合。"""
-        intent = self._route_intent(query)
+        intent = intent or self._route_intent(query)
         map_tools = {
             "astro_my_sign": [astro_my_sign, test, search],
             "astro_natal_chart": [astro_natal_chart, xingpan, test, search],
@@ -387,33 +484,93 @@ class Master:
         return selected
 
     def _invoke_with_timeout(self, func, timeout):
-        """带超时的函数调用"""
+        """带超时的函数调用（同步执行，避免超时后线程继续运行）。"""
+        start = time.perf_counter()
         res = None
-        exc = None
+        try:
+            _thread_ctx.request_timeout = timeout
+            _thread_ctx.request_deadline = start + timeout
+            res = func()
+        except Exception as e:
+            logger.error(f"超时调用函数执行异常: {str(e)[:100]}", exc_info=True)
+            raise
+        finally:
+            if hasattr(_thread_ctx, "request_timeout"):
+                delattr(_thread_ctx, "request_timeout")
+            if hasattr(_thread_ctx, "request_deadline"):
+                delattr(_thread_ctx, "request_deadline")
 
-        def run():
-            nonlocal res, exc
-            try:
-                _thread_ctx.request_timeout = timeout
-                res = func()
-            except Exception as e:
-                exc = e
-                logger.error(f"超时调用函数执行异常: {str(e)[:100]}", exc_info=True)
-            finally:
-                if hasattr(_thread_ctx, "request_timeout"):
-                    delattr(_thread_ctx, "request_timeout")
-
-        t = threading.Thread(target=run)
-        t.daemon = True
-        t.start()
-        t.join(timeout)
-        
-        if t.is_alive():
+        elapsed = time.perf_counter() - start
+        if elapsed > timeout:
+            grace = 2.0
+            overrun = elapsed - timeout
+            if overrun <= grace:
+                logger.warning(
+                    "函数调用轻微超预算但已返回结果 | timeout: %.2fs | elapsed: %.2fs | overrun: %.2fs",
+                    timeout,
+                    elapsed,
+                    overrun,
+                )
+                return res
             logger.warning(f"函数调用超时（{timeout}秒）")
-            raise TimeoutError(f"执行超时（{timeout}秒）")
-        if exc:
-            raise exc
+            err = TimeoutError(f"执行超时（{timeout}秒）")
+            setattr(err, "partial_result", res)
+            raise err
         return res
+
+    def _build_astro_fallback_output(self, steps, query: str) -> str | None:
+        """当总结阶段失败或超时时，从占星工具结果生成兜底摘要。"""
+        if not steps:
+            return None
+
+        astro_tools = {"astro_natal_chart", "astro_current_chart", "astro_transit_chart", "astro_my_sign", "xingpan"}
+        for step in reversed(steps):
+            try:
+                action, observation = step
+                tool_name = getattr(action, "tool", "")
+                if tool_name not in astro_tools:
+                    continue
+
+                raw_text = observation if isinstance(observation, str) else str(observation)
+                payload = json.loads(raw_text)
+                if not isinstance(payload, dict) or not payload.get("ok"):
+                    continue
+
+                data = payload.get("data")
+                core = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+
+                sign_names = []
+                if isinstance(core, dict) and isinstance(core.get("sign"), list):
+                    for item in core.get("sign", [])[:3]:
+                        if isinstance(item, dict):
+                            cn = item.get("sign_cn") or item.get("sign_en")
+                            if cn:
+                                sign_names.append(str(cn))
+
+                sign_text = "、".join(sign_names) if sign_names else "暂无可提取星座名"
+                snippet = json.dumps(core, ensure_ascii=False)[:500] if core is not None else json.dumps(data, ensure_ascii=False)[:500]
+
+                return (
+                    "已成功调用占星工具并拿到结果，但总结模型本轮响应异常，先返回核心信息：\n"
+                    f"- 相关星座：{sign_text}\n"
+                    f"- 查询问题：{query[:60]}\n"
+                    f"- 原始结果片段：{snippet}"
+                )
+            except Exception:
+                continue
+
+        return None
+
+    @staticmethod
+    def _is_bad_astro_output(output: str) -> bool:
+        """识别占星场景下的降级短回复。"""
+        text = (output or "").strip()
+        if not text:
+            return True
+        if len(text) <= 80:
+            return True
+        bad_markers = ["服务异常", "请稍后再试", "超时", "服务不可用", "开小差"]
+        return any(m in text for m in bad_markers)
 
     def mood_chain(self, query: str, timeout=5):
         """情绪识别链"""
@@ -476,7 +633,16 @@ class Master:
         """主运行方法"""
         st = time.time()
         try:
-            logger.info(f"开始处理用户请求 | 查询内容: {query[:100]} | 超时时间: {timeout}秒")
+            intent = self._route_intent(query)
+            astro_intents = {
+                "astro_my_sign",
+                "astro_natal_chart",
+                "astro_current_chart",
+                "astro_transit_chart",
+                "xingpan",
+            }
+            effective_timeout = max(timeout, 90) if intent in astro_intents else timeout
+            logger.info(f"开始处理用户请求 | 查询内容: {query[:100]} | 超时时间: {effective_timeout}秒")
             
             # 情绪识别
             motion = self.mood_chain(query, timeout=3)
@@ -488,21 +654,22 @@ class Master:
                 MessagesPlaceholder("agent_scratchpad"),
             ])
             
-            tools = self._select_tools_by_intent(query)
+            tools = self._select_tools_by_intent(query, intent=intent)
+            max_iterations = 2 if intent in astro_intents else 3
             agent = create_openai_tools_agent(self.normal_llm, tools, prompt)
             agent_executor = AgentExecutor(
                 agent=agent,
                 tools=tools,
                 verbose=not IS_PROD,
                 handle_parsing_errors=lambda e: USER_MESSAGES["parse_error"],
-                max_iterations=3,
+                max_iterations=max_iterations,
                 early_stopping_method="force",
-                return_intermediate_steps=False,
+                return_intermediate_steps=True,
                 return_only_outputs=True,
             )
 
             # 计算剩余超时时间
-            remain = timeout - (time.time() - st)
+            remain = effective_timeout - (time.time() - st)
             if remain <= 0:
                 logger.warning(f"请求处理超时 | 查询内容: {query[:50]} | 已耗时: {time.time()-st:.2f}秒")
                 return {"output": USER_MESSAGES["timeout_response"]}
@@ -514,11 +681,47 @@ class Master:
                     lambda: agent_executor.invoke({"input": query}),
                     timeout=remain
                 )
+                steps = result.get("intermediate_steps", []) if isinstance(result, dict) else []
+                if steps:
+                    for i, step in enumerate(steps, start=1):
+                        try:
+                            action, observation = step
+                            tool_name = getattr(action, "tool", "unknown")
+                            tool_input = str(getattr(action, "tool_input", ""))[:200]
+                            obs_preview = str(observation)[:200]
+                            logger.info(
+                                "工具调用轨迹 | step: %s | tool: %s | input: %s | output: %s",
+                                i,
+                                tool_name,
+                                tool_input,
+                                obs_preview,
+                            )
+                        except Exception as trace_err:
+                            logger.warning("工具调用轨迹解析失败 | step: %s | error: %s", i, str(trace_err)[:100])
+                else:
+                    logger.info("工具调用轨迹 | 本轮未发生工具调用")
+
+                if intent in astro_intents:
+                    final_output = result.get("output", "") if isinstance(result, dict) else ""
+                    if self._is_bad_astro_output(final_output):
+                        fallback_output = self._build_astro_fallback_output(steps, query)
+                        if fallback_output:
+                            logger.warning("占星总结降级触发兜底 | 使用工具结果摘要替代短错误回复")
+                            result["output"] = fallback_output
+
                 agent_elapsed = time.perf_counter() - agent_start
                 logger.info(f"Agent调用完成 | 查询内容: {query[:50]} | 耗时: {agent_elapsed:.2f}秒")
-            except TimeoutError:
+            except TimeoutError as e:
                 agent_elapsed = time.perf_counter() - agent_start
                 logger.warning(f"Agent调用超时 | 查询内容: {query[:50]} | 超时: {remain:.2f}秒 | 已耗时: {agent_elapsed:.2f}秒")
+                partial = getattr(e, "partial_result", None)
+                if intent in astro_intents and isinstance(partial, dict):
+                    steps = partial.get("intermediate_steps", [])
+                    fallback_output = self._build_astro_fallback_output(steps, query)
+                    if fallback_output:
+                        logger.warning("占星超时触发兜底 | 返回工具结果摘要")
+                        partial["output"] = fallback_output
+                        return partial
                 raise
             
             total_time = time.time() - st
