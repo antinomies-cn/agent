@@ -14,6 +14,9 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain.schema import StrOutputParser
+from langchain.memory import ConversationBufferMemory
+from langchain_community.chat_message_histories import RedisChatMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory as InMemoryChatMessageHistory
 from texts import SYSTEMPL, MOODS, MOOD_CLASSIFY_PROMPT, USER_MESSAGES
 
 # 线程本地上下文：为LLM请求传递每次调用的超时
@@ -190,7 +193,7 @@ class CustomProxyLLM(BaseChatModel):
             remaining_budget = request_deadline - time.perf_counter()
             timeout_seconds = min(timeout_seconds, remaining_budget)
 
-        return max(timeout_seconds, 1.0)
+        return max(timeout_seconds, 3.0)
 
     def _request_completion(
         self,
@@ -398,6 +401,7 @@ class Master:
             temperature=0.0,
             max_tokens=12
         )
+
         self.all_tools = [
             search,
             test,
@@ -409,7 +413,160 @@ class Master:
             astro_transit_chart,
         ]
 
+        self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.memory_ttl = int(os.getenv("MEMORY_TTL", "86400"))
+        self.memory_compact_message_count = int(os.getenv("MEMORY_COMPACT_MESSAGE_COUNT", "10"))
+        self.mood_timeout_seconds = float(os.getenv("MOOD_TIMEOUT_SECONDS", "5"))
+        self._local_histories: dict[str, InMemoryChatMessageHistory] = {}
+        self._local_histories_lock = threading.Lock()
+
         logger.info("Master实例初始化完成")
+
+    @staticmethod
+    def _normalize_session_id(session_id: str | None) -> str:
+        """标准化会话ID，避免空值导致多用户共享同一上下文。"""
+        sid = (session_id or "").strip()
+        return sid if sid else "default"
+
+    @staticmethod
+    def _history_messages_to_text(messages: list[BaseMessage]) -> str:
+        """将历史消息转为可摘要文本。"""
+        lines = []
+        for m in messages:
+            role = getattr(m, "type", "unknown")
+            content = getattr(m, "content", "")
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+                    elif isinstance(item, str):
+                        parts.append(item)
+                content_str = "".join(parts)
+            elif isinstance(content, str):
+                content_str = content
+            else:
+                content_str = str(content)
+            lines.append(f"{role}: {content_str}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _append_summary_message(chat_history, summary_text: str) -> None:
+        """向历史中写入单条摘要消息。"""
+        summary = f"历史对话摘要：{summary_text}"
+        if hasattr(chat_history, "add_ai_message"):
+            chat_history.add_ai_message(summary)
+            return
+        if hasattr(chat_history, "add_message"):
+            chat_history.add_message(AIMessage(content=summary))
+            return
+        if hasattr(chat_history, "add_user_message"):
+            chat_history.add_user_message(summary)
+
+    def _get_or_create_local_history(self, session_id: str) -> InMemoryChatMessageHistory:
+        """Redis不可用时，按session复用进程内历史。"""
+        with self._local_histories_lock:
+            history = self._local_histories.get(session_id)
+            if history is None:
+                history = InMemoryChatMessageHistory()
+                self._local_histories[session_id] = history
+            return history
+
+    def _get_chat_history(self, session_id: str):
+        """按session获取消息历史对象，优先Redis，失败降级本地。"""
+        sid = self._normalize_session_id(session_id)
+
+        # 不同版本RedisChatMessageHistory参数名存在差异，逐个尝试。
+        candidate_kwargs = [
+            {"session_id": sid, "url": self.redis_url, "ttl": self.memory_ttl},
+            {"session_id": sid, "url": self.redis_url},
+            {"session_id": sid, "redis_url": self.redis_url, "ttl": self.memory_ttl},
+            {"session_id": sid, "redis_url": self.redis_url},
+        ]
+
+        try:
+            for kwargs in candidate_kwargs:
+                try:
+                    chat_history = RedisChatMessageHistory(**kwargs)
+                    _ = chat_history.messages
+                    return chat_history, "redis"
+                except TypeError:
+                    continue
+
+            # 最后尝试最小参数构造（部分版本只接收session_id）
+            chat_history = RedisChatMessageHistory(session_id=sid)
+            _ = chat_history.messages
+            return chat_history, "redis"
+        except Exception as e:
+            logger.warning("Redis memory不可用，降级到进程内memory | session_id: %s | err: %s", sid, str(e)[:120])
+            return self._get_or_create_local_history(sid), "in_memory"
+
+    def _compact_history_if_needed(self, chat_history, session_id: str) -> None:
+        """当消息数达到阈值时，将历史压缩为单条摘要。"""
+        try:
+            messages = list(chat_history.messages)
+        except Exception as e:
+            logger.warning("读取历史消息失败，跳过压缩 | session_id: %s | err: %s", session_id, str(e)[:120])
+            return
+
+        threshold = max(1, self.memory_compact_message_count)
+        if len(messages) < threshold:
+            return
+
+        history_text = self._history_messages_to_text(messages)
+        if not history_text.strip():
+            return
+
+        summary_prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                "你是对话记忆压缩助手。请将对话压缩为一条简洁摘要，保留用户事实信息、偏好、约束、已完成事项和未完成事项；"
+                "避免冗余和寒暄；输出纯文本。",
+            ),
+            ("user", "请压缩以下历史对话：\n{history_text}"),
+        ])
+
+        summary_chain = summary_prompt | self.normal_llm | StrOutputParser()
+        summary_text = ""
+        try:
+            summary_text = self._invoke_with_timeout(
+                lambda: summary_chain.invoke({"history_text": history_text}),
+                timeout=15,
+            ).strip()
+        except Exception as e:
+            logger.warning("历史压缩失败，回退截断摘要 | session_id: %s | err: %s", session_id, str(e)[:120])
+
+        if not summary_text:
+            summary_text = history_text[-1000:]
+
+        try:
+            chat_history.clear()
+            self._append_summary_message(chat_history, summary_text)
+            logger.info(
+                "历史压缩完成 | session_id: %s | before_messages: %s | after_messages: 1",
+                session_id,
+                len(messages),
+            )
+        except Exception as e:
+            logger.error("写回压缩摘要失败 | session_id: %s | err: %s", session_id, str(e)[:120], exc_info=True)
+
+    def _build_memory(self, session_id: str) -> ConversationBufferMemory:
+        """按会话ID构建Memory，历史落Redis，使用消息缓冲避免tokenizer外网依赖。"""
+        sid = self._normalize_session_id(session_id)
+        chat_history, _ = self._get_chat_history(sid)
+
+        self._compact_history_if_needed(chat_history, sid)
+
+        return ConversationBufferMemory(
+            human_prefix="用户",
+            ai_prefix="占卜大师",
+            memory_key="history",
+            output_key="output",
+            return_messages=True,
+            chat_memory=chat_history,
+        )
 
     @staticmethod
     def _match_keywords(text: str, mapping: list[tuple[str, list[str]]], default: str) -> str:
@@ -591,10 +748,11 @@ class Master:
 
         return None
 
-    def run(self, query, timeout=60):
+    def run(self, query, timeout=60, session_id: str = "default"):
         """主运行方法"""
         st = time.time()
         try:
+            sid = self._normalize_session_id(session_id)
             intent = self._route_intent(query)
             astro_intents = {
                 "astro_my_sign",
@@ -604,24 +762,27 @@ class Master:
                 "xingpan",
             }
             effective_timeout = max(timeout, 90) if intent in astro_intents else timeout
-            logger.info(f"开始处理用户请求 | 查询内容: {query[:100]} | 超时时间: {effective_timeout}秒")
+            logger.info(f"开始处理用户请求 | session_id: {sid} | 查询内容: {query[:100]} | 超时时间: {effective_timeout}秒")
             
             # 情绪识别
-            motion = self.mood_chain(query, timeout=3)
+            motion = self.mood_chain(query, timeout=self.mood_timeout_seconds)
 
-            # 每次请求使用独立的prompt与agent，避免并发串话
+            # 每次请求使用独立的prompt、memory与agent，避免并发串话
             prompt = ChatPromptTemplate.from_messages([
                 SystemMessage(SYSTEMPL.format(who_you_are=MOODS[motion]["roleSet"])),
+                MessagesPlaceholder("history"),
                 ("user", "{input}"),
                 MessagesPlaceholder("agent_scratchpad"),
             ])
             
+            memory = self._build_memory(sid)
             tools = self._select_tools_by_intent(query, intent=intent)
             max_iterations = 2 if intent in astro_intents else 3
             agent = create_openai_tools_agent(self.normal_llm, tools, prompt)
             agent_executor = AgentExecutor(
                 agent=agent,
                 tools=tools,
+                memory=memory,
                 verbose=not IS_PROD,
                 handle_parsing_errors=lambda e: USER_MESSAGES["parse_error"],
                 max_iterations=max_iterations,
@@ -639,10 +800,7 @@ class Master:
             # 执行Agent
             agent_start = time.perf_counter()
             try:
-                result = self._invoke_with_timeout(
-                    lambda: agent_executor.invoke({"input": query}),
-                    timeout=remain
-                )
+                result = self._invoke_with_timeout(lambda: agent_executor.invoke({"input": query}), timeout=remain)
                 steps = result.get("intermediate_steps", []) if isinstance(result, dict) else []
                 if steps:
                     for i, step in enumerate(steps, start=1):
@@ -687,23 +845,23 @@ class Master:
                 raise
             
             total_time = time.time() - st
-            logger.info(f"请求处理完成 | 查询内容: {query[:50]} | 耗时: {total_time:.2f}秒")
+            logger.info(f"请求处理完成 | session_id: {sid} | 查询内容: {query[:50]} | 耗时: {total_time:.2f}秒")
             return result
             
         except Exception as e:
             error_msg = str(e)[:100]
-            logger.error(f"run方法执行异常 | 查询内容: {query[:50]} | 错误: {error_msg}", exc_info=True)
+            logger.error(f"run方法执行异常 | session_id: {session_id} | 查询内容: {query[:50]} | 错误: {error_msg}", exc_info=True)
             return {"output": f"服务异常：{error_msg}"}
 
-    async def run_async(self, query, timeout=60):
+    async def run_async(self, query, timeout=60, session_id: str = "default"):
         """异步封装"""
         import asyncio
         loop = asyncio.get_running_loop()
         try:
-            res = await loop.run_in_executor(None, self.run, query, timeout)
+            res = await loop.run_in_executor(None, self.run, query, timeout, session_id)
             return res
         except Exception as e:
-            logger.error(f"异步调用异常 | 查询内容: {query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
+            logger.error(f"异步调用异常 | session_id: {session_id} | 查询内容: {query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
             return {"output": "服务异常，请稍后再试"}
 
     @staticmethod
@@ -742,6 +900,27 @@ class Master:
             logger.error(f"LLM健康检查失败 | 错误: {str(e)[:100]}", exc_info=True)
             return False
 
+    def get_memory_status(self, session_id: str) -> dict:
+        """返回指定session的memory状态，用于联调观察。"""
+        sid = self._normalize_session_id(session_id)
+        chat_history, backend = self._get_chat_history(sid)
+        messages = list(chat_history.messages)
+        msg_count = len(messages)
+        threshold = max(1, self.memory_compact_message_count)
+
+        latest_preview = ""
+        if messages:
+            latest_preview = self._extract_preview_text(messages[-1])[:120]
+
+        return {
+            "session_id": sid,
+            "memory_backend": backend,
+            "message_count": msg_count,
+            "compact_threshold": threshold,
+            "will_compact_on_next_request": msg_count >= threshold,
+            "latest_message_preview": latest_preview,
+        }
+
 # 全局单例
 master = Master()
 
@@ -752,17 +931,17 @@ def read_root():
     return {"Hello": "World"}
 
 @app.post("/chat")
-def chat(query: str):
-    logger.info(f"接收Chat API请求 | 查询: {query[:100]}")
+def chat(query: str, session_id: str = "default"):
+    logger.info(f"接收Chat API请求 | session_id: {session_id} | 查询: {query[:100]}")
     try:
-        res = master.run(query)
+        res = master.run(query, session_id=session_id)
         response_text = res.get("output", "")
-        logger.info(f"Chat API响应成功 | 查询: {query[:50]} | 响应长度: {len(response_text)}")
-        return {"code": 200, "query": query, "response": response_text}
+        logger.info(f"Chat API响应成功 | session_id: {session_id} | 查询: {query[:50]} | 响应长度: {len(response_text)}")
+        return {"code": 200, "session_id": session_id, "query": query, "response": response_text}
     except Exception as e:
         error_msg = str(e)[:100]
         logger.error(f"Chat API执行异常 | 查询: {query[:50]} | 错误: {error_msg}", exc_info=True)
-        return {"code": 500, "query": query, "response": f"错误：{error_msg}"}
+        return {"code": 500, "session_id": session_id, "query": query, "response": f"错误：{error_msg}"}
 
 @app.post("/add_urls")
 def add_urls():
@@ -803,19 +982,32 @@ async def health_check():
             "error": str(e)[:100]
         }
 
+@app.get("/memory/status")
+def memory_status(session_id: str = "default"):
+    """查看指定session的memory状态。"""
+    try:
+        status = master.get_memory_status(session_id)
+        logger.info("memory状态查询成功 | session_id: %s | count: %s", status["session_id"], status["message_count"])
+        return {"code": 200, "data": status}
+    except Exception as e:
+        err = str(e)[:120]
+        logger.error("memory状态查询失败 | session_id: %s | err: %s", session_id, err, exc_info=True)
+        return {"code": 500, "session_id": session_id, "error": err}
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     """WebSocket接口"""
     await websocket.accept()
     client_ip = websocket.client.host
-    logger.info(f"WebSocket连接建立 | 客户端IP: {client_ip}")
+    session_id = websocket.query_params.get("session_id") or f"ws_{client_ip}_{int(time.time())}"
+    logger.info(f"WebSocket连接建立 | 客户端IP: {client_ip} | session_id: {session_id}")
     
     try:
         while True:
             data = await websocket.receive_text()
-            logger.info(f"WebSocket接收消息 | 客户端IP: {client_ip} | 消息: {data[:100]}")
+            logger.info(f"WebSocket接收消息 | 客户端IP: {client_ip} | session_id: {session_id} | 消息: {data[:100]}")
             
-            res = await master.run_async(data)
+            res = await master.run_async(data, session_id=session_id)
             clean_response = res.get("output", USER_MESSAGES["ws_default"])
             
             await websocket.send_text(clean_response)
