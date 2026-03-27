@@ -1,9 +1,11 @@
 import os
+from pydoc import doc
 import time
 import json
 import re
 import logging
 import logging.handlers
+from unittest import loader
 import requests
 import threading
 from Mytools import *
@@ -16,8 +18,10 @@ from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain.schema import StrOutputParser
 from langchain.memory import ConversationBufferMemory
+from langchain.text_splitter import RecursiveCharacterTextSplitter  
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory as InMemoryChatMessageHistory
+from langchain_community.document_loaders import WebBaseLoader
 from texts import SYSTEMPL, MOODS, MOOD_CLASSIFY_PROMPT, USER_MESSAGES
 
 # 线程本地上下文：为LLM请求传递每次调用的超时
@@ -85,7 +89,6 @@ logger = setup_logger()
 IS_PROD = os.getenv("ENV", "dev") == "prod"
 
 app = FastAPI()
-
 
 # ===================== 自定义LLM =====================
 class CustomProxyLLM(BaseChatModel):
@@ -1040,8 +1043,14 @@ def chat(query: str, session_id: str):
         return {"code": 500, "session_id": session_id, "query": query, "response": f"错误：{error_msg}"}
 
 @app.post("/add_urls")
-def add_urls():
-    logger.info("调用add_urls接口")
+def add_urls(URL:str):
+    loader = WebBaseLoader(URL)
+    documents = loader.load()
+    docs = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=50,
+    )
+    logger.info("调用add_urls接口" )
     return {"response": "URLs added!"}
 
 @app.post("/add_pdfs")
