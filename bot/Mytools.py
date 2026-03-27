@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import importlib.util
 import logging
 import threading
 import requests
@@ -167,7 +169,7 @@ def _get_vector_retriever():
         vector_store = Qdrant(
             QdrantClient(path=db_path),
             collection_name,
-            OpenAIEmbeddings(),
+            OpenAIEmbeddings(model="text-embedding-3-small", dimensions=384),
         )
         _vector_retriever = vector_store.as_retriever(
             search_type="mmr",
@@ -189,6 +191,7 @@ def test(scope: str = "all") -> str:
     参数:
     - scope: all|astro|vector|search
     """
+    start = time.perf_counter()
     clean_scope = (scope or "all").strip().lower()
     if clean_scope not in {"all", "astro", "vector", "search"}:
         return "scope 参数仅支持 all|astro|vector|search。"
@@ -197,6 +200,10 @@ def test(scope: str = "all") -> str:
         "scope": clean_scope,
         "ok": True,
         "checks": {},
+        "meta": {
+            "tool": "test",
+            "version": "1.1",
+        },
     }
 
     if clean_scope in {"all", "astro"}:
@@ -209,10 +216,36 @@ def test(scope: str = "all") -> str:
             missing.append("XINGPAN_APP_KEY")
             astro_ok = False
 
+        uid = (os.getenv("ASTRO_UID", "") or os.getenv("UID", "")).strip()
+        timeout_text = os.getenv("XINGPAN_TIMEOUT", "15")
+        try:
+            timeout_seconds = float(timeout_text)
+        except ValueError:
+            timeout_seconds = 15.0
+
+        probe_ok = False
+        probe_msg = ""
+        if astro_ok and uid:
+            try:
+                probe_raw = _request_astro_api(f"mySign/{uid}", method="GET")
+                probe_data = json.loads(probe_raw)
+                probe_ok = bool(probe_data.get("ok"))
+                probe_msg = probe_data.get("code", "") if isinstance(probe_data, dict) else ""
+                astro_ok = astro_ok and probe_ok
+            except Exception as e:
+                probe_msg = str(e)[:120]
+                astro_ok = False
+        elif astro_ok and not uid:
+            probe_msg = "缺少 ASTRO_UID/UID，跳过接口探测"
+
         report["checks"]["astro"] = {
             "ok": astro_ok,
             "base_url": _astro_base_url(),
             "missing_env": missing,
+            "uid_present": bool(uid),
+            "timeout_seconds": timeout_seconds,
+            "api_probe_ok": probe_ok,
+            "api_probe_msg": probe_msg,
         }
         report["ok"] = report["ok"] and astro_ok
 
@@ -234,13 +267,18 @@ def test(scope: str = "all") -> str:
         report["ok"] = report["ok"] and vector_ok
 
     if clean_scope in {"all", "search"}:
-        search_ok = bool(os.getenv("SERPAPI_API_KEY", "").strip())
+        has_key = bool(os.getenv("SERPAPI_API_KEY", "").strip())
+        serpapi_installed = importlib.util.find_spec("serpapi") is not None
+        search_ok = has_key and serpapi_installed
         report["checks"]["search"] = {
             "ok": search_ok,
-            "missing_env": [] if search_ok else ["SERPAPI_API_KEY"],
+            "serpapi_installed": serpapi_installed,
+            "missing_env": [] if has_key else ["SERPAPI_API_KEY"],
         }
         report["ok"] = report["ok"] and search_ok
 
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    report["meta"]["elapsed_ms"] = elapsed_ms
     logger.info("执行测试工具 | scope: %s | ok: %s", clean_scope, report["ok"])
     return json.dumps(report, ensure_ascii=False)
 
