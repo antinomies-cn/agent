@@ -1,13 +1,14 @@
 import os
 import time
 import json
+import re
 import logging
 import logging.handlers
 import requests
 import threading
 from Mytools import *
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from langchain.agents import create_openai_tools_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.language_models import BaseChatModel
@@ -419,14 +420,27 @@ class Master:
         self.mood_timeout_seconds = float(os.getenv("MOOD_TIMEOUT_SECONDS", "5"))
         self._local_histories: dict[str, InMemoryChatMessageHistory] = {}
         self._local_histories_lock = threading.Lock()
+        self._session_locks: dict[str, threading.Lock] = {}
+        self._session_locks_guard = threading.Lock()
 
         logger.info("Master实例初始化完成")
 
     @staticmethod
     def _normalize_session_id(session_id: str | None) -> str:
-        """标准化会话ID，避免空值导致多用户共享同一上下文。"""
+        """标准化会话ID，空值直接拒绝，避免多用户共享同一上下文。"""
         sid = (session_id or "").strip()
-        return sid if sid else "default"
+        if not sid:
+            raise ValueError("session_id不能为空")
+        return sid
+
+    def _get_session_lock(self, session_id: str) -> threading.Lock:
+        """获取会话级锁，保证同一session请求串行执行。"""
+        with self._session_locks_guard:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_locks[session_id] = lock
+            return lock
 
     @staticmethod
     def _history_messages_to_text(messages: list[BaseMessage]) -> str:
@@ -451,6 +465,72 @@ class Master:
                 content_str = str(content)
             lines.append(f"{role}: {content_str}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_user_facts_from_messages(messages: list[BaseMessage]) -> dict[str, str]:
+        """从历史消息中抽取用户关键信息，确保压缩后可保留。"""
+        facts: dict[str, str] = {}
+        text_parts: list[str] = []
+
+        for msg in messages:
+            role = getattr(msg, "type", "")
+            if role not in {"human", "user"}:
+                continue
+
+            content = getattr(msg, "content", "")
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text")
+                        if isinstance(text, str):
+                            text_parts.append(text)
+                    elif isinstance(item, str):
+                        text_parts.append(item)
+
+        if not text_parts:
+            return facts
+
+        merged = "\n".join(text_parts)
+
+        patterns = {
+            "姓名": [r"我叫\s*([\u4e00-\u9fa5A-Za-z0-9_]{2,20})", r"名字是\s*([\u4e00-\u9fa5A-Za-z0-9_]{2,20})"],
+            "年龄": [r"我(?:今年|现在)?\s*(\d{1,3})\s*岁"],
+            "性别": [r"我是\s*(男生|女生|男性|女性|男|女)", r"性别\s*[是:：]?\s*(男生|女生|男性|女性|男|女)"],
+            "生日": [r"(?:生日|出生日期)\s*[是:：]?\s*([0-9]{4}[年\-/\.][0-9]{1,2}[月\-/\.][0-9]{1,2}日?)"],
+            "出生地": [r"(?:我来自|我是)\s*([\u4e00-\u9fa5]{2,15})人", r"(?:出生在|老家在|来自)\s*([\u4e00-\u9fa5]{2,20})"],
+            "常驻地": [r"(?:我在|我住在|目前在)\s*([\u4e00-\u9fa5A-Za-z0-9\-\s]{2,30})"],
+        }
+
+        for key, regex_list in patterns.items():
+            for pattern in regex_list:
+                match = re.search(pattern, merged)
+                if match:
+                    value = match.group(1).strip()
+                    if value:
+                        facts[key] = value
+                        break
+
+        # 简单偏好提取（只取第一条，避免过长）
+        pref = re.search(r"我(?:比较)?喜欢\s*([^。！？\n]{1,30})", merged)
+        if pref:
+            facts["偏好"] = pref.group(1).strip()
+
+        return facts
+
+    @staticmethod
+    def _format_user_facts(facts: dict[str, str]) -> str:
+        """将用户关键信息格式化为固定文本。"""
+        if not facts:
+            return "暂无明确用户信息"
+        ordered_keys = ["姓名", "年龄", "性别", "生日", "出生地", "常驻地", "偏好"]
+        parts = []
+        for key in ordered_keys:
+            value = facts.get(key)
+            if value:
+                parts.append(f"{key}:{value}")
+        return "；".join(parts) if parts else "暂无明确用户信息"
 
     @staticmethod
     def _append_summary_message(chat_history, summary_text: str) -> None:
@@ -519,20 +599,30 @@ class Master:
         if not history_text.strip():
             return
 
+        user_facts = self._extract_user_facts_from_messages(messages)
+        facts_text = self._format_user_facts(user_facts)
+
         summary_prompt = ChatPromptTemplate.from_messages([
             (
                 "system",
                 "你是对话记忆压缩助手。请将对话压缩为一条简洁摘要，保留用户事实信息、偏好、约束、已完成事项和未完成事项；"
-                "避免冗余和寒暄；输出纯文本。",
+                "避免冗余和寒暄。请严格输出两段：\n"
+                "用户关键信息：<仅保留可确认事实，未知写无>\n"
+                "摘要：<对话摘要>",
             ),
-            ("user", "请压缩以下历史对话：\n{history_text}"),
+            (
+                "user",
+                "请压缩以下历史对话，并确保保留用户信息。\n"
+                "规则抽取到的用户信息：{facts_text}\n"
+                "历史对话：\n{history_text}",
+            ),
         ])
 
         summary_chain = summary_prompt | self.normal_llm | StrOutputParser()
         summary_text = ""
         try:
             summary_text = self._invoke_with_timeout(
-                lambda: summary_chain.invoke({"history_text": history_text}),
+                lambda: summary_chain.invoke({"history_text": history_text, "facts_text": facts_text}),
                 timeout=15,
             ).strip()
         except Exception as e:
@@ -540,6 +630,9 @@ class Master:
 
         if not summary_text:
             summary_text = history_text[-1000:]
+
+        # 双保险：即使模型摘要不规范，也强制把用户关键信息写进压缩结果。
+        summary_text = f"用户关键信息：{facts_text}\n摘要：{summary_text}"
 
         try:
             chat_history.clear()
@@ -748,112 +841,113 @@ class Master:
 
         return None
 
-    def run(self, query, timeout=60, session_id: str = "default"):
+    def run(self, query, timeout=60, session_id: str | None = None):
         """主运行方法"""
         st = time.time()
         try:
             sid = self._normalize_session_id(session_id)
-            intent = self._route_intent(query)
-            astro_intents = {
-                "astro_my_sign",
-                "astro_natal_chart",
-                "astro_current_chart",
-                "astro_transit_chart",
-                "xingpan",
-            }
-            effective_timeout = max(timeout, 90) if intent in astro_intents else timeout
-            logger.info(f"开始处理用户请求 | session_id: {sid} | 查询内容: {query[:100]} | 超时时间: {effective_timeout}秒")
-            
-            # 情绪识别
-            motion = self.mood_chain(query, timeout=self.mood_timeout_seconds)
+            with self._get_session_lock(sid):
+                intent = self._route_intent(query)
+                astro_intents = {
+                    "astro_my_sign",
+                    "astro_natal_chart",
+                    "astro_current_chart",
+                    "astro_transit_chart",
+                    "xingpan",
+                }
+                effective_timeout = max(timeout, 90) if intent in astro_intents else timeout
+                logger.info(f"开始处理用户请求 | session_id: {sid} | 查询内容: {query[:100]} | 超时时间: {effective_timeout}秒")
+                
+                # 情绪识别
+                motion = self.mood_chain(query, timeout=self.mood_timeout_seconds)
 
-            # 每次请求使用独立的prompt、memory与agent，避免并发串话
-            prompt = ChatPromptTemplate.from_messages([
-                SystemMessage(SYSTEMPL.format(who_you_are=MOODS[motion]["roleSet"])),
-                MessagesPlaceholder("history"),
-                ("user", "{input}"),
-                MessagesPlaceholder("agent_scratchpad"),
-            ])
-            
-            memory = self._build_memory(sid)
-            tools = self._select_tools_by_intent(query, intent=intent)
-            max_iterations = 2 if intent in astro_intents else 3
-            agent = create_openai_tools_agent(self.normal_llm, tools, prompt)
-            agent_executor = AgentExecutor(
-                agent=agent,
-                tools=tools,
-                memory=memory,
-                verbose=not IS_PROD,
-                handle_parsing_errors=lambda e: USER_MESSAGES["parse_error"],
-                max_iterations=max_iterations,
-                early_stopping_method="force",
-                return_intermediate_steps=True,
-                return_only_outputs=True,
-            )
+                # 每次请求使用独立的prompt、memory与agent，避免并发串话
+                prompt = ChatPromptTemplate.from_messages([
+                    SystemMessage(SYSTEMPL.format(who_you_are=MOODS[motion]["roleSet"])),
+                    MessagesPlaceholder("history"),
+                    ("user", "{input}"),
+                    MessagesPlaceholder("agent_scratchpad"),
+                ])
+                
+                memory = self._build_memory(sid)
+                tools = self._select_tools_by_intent(query, intent=intent)
+                max_iterations = 2 if intent in astro_intents else 3
+                agent = create_openai_tools_agent(self.normal_llm, tools, prompt)
+                agent_executor = AgentExecutor(
+                    agent=agent,
+                    tools=tools,
+                    memory=memory,
+                    verbose=not IS_PROD,
+                    handle_parsing_errors=lambda e: USER_MESSAGES["parse_error"],
+                    max_iterations=max_iterations,
+                    early_stopping_method="force",
+                    return_intermediate_steps=True,
+                    return_only_outputs=True,
+                )
 
-            # 计算剩余超时时间
-            remain = effective_timeout - (time.time() - st)
-            if remain <= 0:
-                logger.warning(f"请求处理超时 | 查询内容: {query[:50]} | 已耗时: {time.time()-st:.2f}秒")
-                return {"output": USER_MESSAGES["timeout_response"]}
+                # 计算剩余超时时间
+                remain = effective_timeout - (time.time() - st)
+                if remain <= 0:
+                    logger.warning(f"请求处理超时 | 查询内容: {query[:50]} | 已耗时: {time.time()-st:.2f}秒")
+                    return {"output": USER_MESSAGES["timeout_response"]}
 
-            # 执行Agent
-            agent_start = time.perf_counter()
-            try:
-                result = self._invoke_with_timeout(lambda: agent_executor.invoke({"input": query}), timeout=remain)
-                steps = result.get("intermediate_steps", []) if isinstance(result, dict) else []
-                if steps:
-                    for i, step in enumerate(steps, start=1):
-                        try:
-                            action, observation = step
-                            tool_name = getattr(action, "tool", "unknown")
-                            tool_input = str(getattr(action, "tool_input", ""))[:200]
-                            obs_preview = str(observation)[:200]
-                            logger.info(
-                                "工具调用轨迹 | step: %s | tool: %s | input: %s | output: %s",
-                                i,
-                                tool_name,
-                                tool_input,
-                                obs_preview,
-                            )
-                        except Exception as trace_err:
-                            logger.warning("工具调用轨迹解析失败 | step: %s | error: %s", i, str(trace_err)[:100])
-                else:
-                    logger.info("工具调用轨迹 | 本轮未发生工具调用")
+                # 执行Agent
+                agent_start = time.perf_counter()
+                try:
+                    result = self._invoke_with_timeout(lambda: agent_executor.invoke({"input": query}), timeout=remain)
+                    steps = result.get("intermediate_steps", []) if isinstance(result, dict) else []
+                    if steps:
+                        for i, step in enumerate(steps, start=1):
+                            try:
+                                action, observation = step
+                                tool_name = getattr(action, "tool", "unknown")
+                                tool_input = str(getattr(action, "tool_input", ""))[:200]
+                                obs_preview = str(observation)[:200]
+                                logger.info(
+                                    "工具调用轨迹 | step: %s | tool: %s | input: %s | output: %s",
+                                    i,
+                                    tool_name,
+                                    tool_input,
+                                    obs_preview,
+                                )
+                            except Exception as trace_err:
+                                logger.warning("工具调用轨迹解析失败 | step: %s | error: %s", i, str(trace_err)[:100])
+                    else:
+                        logger.info("工具调用轨迹 | 本轮未发生工具调用")
 
-                if intent in astro_intents:
-                    final_output = result.get("output", "") if isinstance(result, dict) else ""
-                    if self._is_bad_astro_output(final_output):
+                    if intent in astro_intents:
+                        final_output = result.get("output", "") if isinstance(result, dict) else ""
+                        if self._is_bad_astro_output(final_output):
+                            fallback_output = self._build_astro_fallback_output(steps, query)
+                            if fallback_output:
+                                logger.warning("占星总结降级触发兜底 | 使用工具结果摘要替代短错误回复")
+                                result["output"] = fallback_output
+
+                    agent_elapsed = time.perf_counter() - agent_start
+                    logger.info(f"Agent调用完成 | 查询内容: {query[:50]} | 耗时: {agent_elapsed:.2f}秒")
+                except TimeoutError as e:
+                    agent_elapsed = time.perf_counter() - agent_start
+                    logger.warning(f"Agent调用超时 | 查询内容: {query[:50]} | 超时: {remain:.2f}秒 | 已耗时: {agent_elapsed:.2f}秒")
+                    partial = getattr(e, "partial_result", None)
+                    if intent in astro_intents and isinstance(partial, dict):
+                        steps = partial.get("intermediate_steps", [])
                         fallback_output = self._build_astro_fallback_output(steps, query)
                         if fallback_output:
-                            logger.warning("占星总结降级触发兜底 | 使用工具结果摘要替代短错误回复")
-                            result["output"] = fallback_output
-
-                agent_elapsed = time.perf_counter() - agent_start
-                logger.info(f"Agent调用完成 | 查询内容: {query[:50]} | 耗时: {agent_elapsed:.2f}秒")
-            except TimeoutError as e:
-                agent_elapsed = time.perf_counter() - agent_start
-                logger.warning(f"Agent调用超时 | 查询内容: {query[:50]} | 超时: {remain:.2f}秒 | 已耗时: {agent_elapsed:.2f}秒")
-                partial = getattr(e, "partial_result", None)
-                if intent in astro_intents and isinstance(partial, dict):
-                    steps = partial.get("intermediate_steps", [])
-                    fallback_output = self._build_astro_fallback_output(steps, query)
-                    if fallback_output:
-                        logger.warning("占星超时触发兜底 | 返回工具结果摘要")
-                        partial["output"] = fallback_output
-                        return partial
-                raise
-            
-            total_time = time.time() - st
-            logger.info(f"请求处理完成 | session_id: {sid} | 查询内容: {query[:50]} | 耗时: {total_time:.2f}秒")
-            return result
+                            logger.warning("占星超时触发兜底 | 返回工具结果摘要")
+                            partial["output"] = fallback_output
+                            return partial
+                    raise
+                
+                total_time = time.time() - st
+                logger.info(f"请求处理完成 | session_id: {sid} | 查询内容: {query[:50]} | 耗时: {total_time:.2f}秒")
+                return result
             
         except Exception as e:
             error_msg = str(e)[:100]
             logger.error(f"run方法执行异常 | session_id: {session_id} | 查询内容: {query[:50]} | 错误: {error_msg}", exc_info=True)
             return {"output": f"服务异常：{error_msg}"}
 
-    async def run_async(self, query, timeout=60, session_id: str = "default"):
+    async def run_async(self, query, timeout=60, session_id: str | None = None):
         """异步封装"""
         import asyncio
         loop = asyncio.get_running_loop()
@@ -931,8 +1025,10 @@ def read_root():
     return {"Hello": "World"}
 
 @app.post("/chat")
-def chat(query: str, session_id: str = "default"):
+def chat(query: str, session_id: str):
     logger.info(f"接收Chat API请求 | session_id: {session_id} | 查询: {query[:100]}")
+    if not session_id.strip():
+        raise HTTPException(status_code=400, detail="session_id不能为空")
     try:
         res = master.run(query, session_id=session_id)
         response_text = res.get("output", "")
@@ -983,8 +1079,10 @@ async def health_check():
         }
 
 @app.get("/memory/status")
-def memory_status(session_id: str = "default"):
+def memory_status(session_id: str):
     """查看指定session的memory状态。"""
+    if not session_id.strip():
+        raise HTTPException(status_code=400, detail="session_id不能为空")
     try:
         status = master.get_memory_status(session_id)
         logger.info("memory状态查询成功 | session_id: %s | count: %s", status["session_id"], status["message_count"])
@@ -999,7 +1097,11 @@ async def ws(websocket: WebSocket):
     """WebSocket接口"""
     await websocket.accept()
     client_ip = websocket.client.host
-    session_id = websocket.query_params.get("session_id") or f"ws_{client_ip}_{int(time.time())}"
+    session_id = (websocket.query_params.get("session_id") or "").strip()
+    if not session_id:
+        logger.warning("WebSocket连接拒绝 | 客户端IP: %s | 原因: session_id不能为空", client_ip)
+        await websocket.close(code=1008, reason="session_id不能为空")
+        return
     logger.info(f"WebSocket连接建立 | 客户端IP: {client_ip} | session_id: {session_id}")
     
     try:
