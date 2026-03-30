@@ -159,6 +159,8 @@ def _get_vector_retriever():
         if _vector_retriever is not None:
             return _vector_retriever
 
+        qdrant_url = os.getenv("QDRANT_URL", "").strip()
+        qdrant_api_key = os.getenv("QDRANT_API_KEY", "").strip()
         db_path = os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db")
         collection_name = os.getenv("QDRANT_COLLECTION", "divination_master_collection")
         try:
@@ -166,8 +168,15 @@ def _get_vector_retriever():
         except ValueError:
             top_k = 4
 
+        if qdrant_url:
+            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
+            mode = "remote"
+        else:
+            client = QdrantClient(path=db_path)
+            mode = "local"
+
         vector_store = Qdrant(
-            QdrantClient(path=db_path),
+            client,
             collection_name,
             OpenAIEmbeddings(model="text-embedding-3-small", dimensions=384),
         )
@@ -176,8 +185,10 @@ def _get_vector_retriever():
             search_kwargs={"k": max(1, top_k)},
         )
         logger.info(
-            "向量检索器初始化完成 | db_path: %s | collection: %s | top_k: %s",
+            "向量检索器初始化完成 | mode: %s | db_path: %s | url: %s | collection: %s | top_k: %s",
+            mode,
             db_path,
+            qdrant_url or "",
             collection_name,
             max(1, top_k),
         )

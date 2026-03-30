@@ -14,6 +14,11 @@ if __package__ in (None, ""):
 from app.core.config import IS_PROD
 from app.core.logger_setup import logger
 from app.services.master_service import Master
+from app.services.qdrant_service import (
+    init_qdrant_collection,
+    qdrant_health,
+    qdrant_list_collections,
+)
 from app.core.texts import USER_MESSAGES
 
 app = FastAPI()
@@ -59,6 +64,42 @@ def add_pdfs():
 def add_texts():
     logger.info("调用add_texts接口")
     return {"response": "Texts added!"}
+
+@app.post("/qdrant/init")
+def init_qdrant():
+    """初始化Qdrant collection。"""
+    try:
+        result = init_qdrant_collection()
+        logger.info("Qdrant初始化完成 | result: %s", result)
+        return {"code": 200, "data": result}
+    except Exception as e:
+        err = str(e)[:120]
+        logger.error("Qdrant初始化失败 | err: %s", err, exc_info=True)
+        return {"code": 500, "error": err}
+
+@app.get("/qdrant/health")
+def qdrant_health_check():
+    """Qdrant连通性检查。"""
+    try:
+        result = qdrant_health()
+        logger.info("Qdrant健康检查 | result: %s", result)
+        return {"code": 200, "data": result}
+    except Exception as e:
+        err = str(e)[:120]
+        logger.error("Qdrant健康检查失败 | err: %s", err, exc_info=True)
+        return {"code": 500, "error": err}
+
+@app.get("/qdrant/collections")
+def qdrant_collections():
+    """列出Qdrant collections。"""
+    try:
+        result = qdrant_list_collections()
+        logger.info("Qdrant collections | result: %s", result)
+        return {"code": 200, "data": result}
+    except Exception as e:
+        err = str(e)[:120]
+        logger.error("Qdrant collections失败 | err: %s", err, exc_info=True)
+        return {"code": 500, "error": err}
 
 @app.get("/health")
 async def health_check():

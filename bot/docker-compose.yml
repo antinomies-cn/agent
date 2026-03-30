@@ -20,12 +20,16 @@ services:
       OPENAI_API_BASE: "${OPENAI_API_BASE}"
       OPENAI_MODEL: "${OPENAI_MODEL}"
       SERPAPI_API_KEY: "${SERPAPI_API_KEY:-}"
+      QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
+      QDRANT_API_KEY: "${QDRANT_API_KEY:-64588515}"
       XINGPAN_APP_ID: "${XINGPAN_APP_ID:-}"
       XINGPAN_APP_KEY: "${XINGPAN_APP_KEY:-}"
       ASTRO_UID: "${ASTRO_UID:-}"
     depends_on:
       redis:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     volumes:
       - ./logs:/app/logs
       - ./qdrant_data:/app/qdrant_data
@@ -45,5 +49,17 @@ services:
     volumes:
       - redis_data:/data
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: myqdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY:-64588515}"
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
 volumes:
   redis_data:
+  qdrant_storage:
