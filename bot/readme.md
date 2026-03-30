@@ -1,24 +1,27 @@
-# Chatbot Agent 开发文档
+# Chatbot Agent 技术文档
 
 ## 项目概览
 
 这是一个基于 FastAPI + LangChain 的占卜/问答 Agent 服务，支持：
 
 1. HTTP 与 WebSocket 双通道对话
-2. 工具调用（占星、搜索、向量检索、自检）
-3. 会话记忆（Redis 优先，失败自动降级内存）
-4. 日志观测与健康检查
+2. 工具调用（占星、联网搜索、向量检索、自检）
+3. 会话记忆（Redis 优先，失败自动降级进程内内存）
+4. URL 学习入库（抓取、切块、向量化、写入 Qdrant）
+5. 健康检查、Qdrant 运维接口、结构化日志
 
 ---
 
 ## 目录
 
-1. [架构总览](#架构总览)
-2. [接口清单](#接口清单)
-3. [客户端流程](#客户端流程)
-4. [学习能力流程](#学习能力流程)
-5. [方法手册](#方法手册)
-6. [需求改造执行模板](#需求改造执行模板)
+1. 架构总览
+2. 接口清单
+3. 核心流程
+4. 配置规范
+5. 方法手册
+6. 测试与回归
+7. 需求改造执行模板
+8. 项目架构图
 
 ---
 
@@ -26,28 +29,32 @@
 
 ### 服务器端
 
-1. 技术选型：Python + FastAPI
-2. 核心接口：
-     - `POST /chat`
-     - `POST /add_urls`
-     - `POST /add_pdfs`
-     - `POST /add_texts`
-3. 记忆存储：Redis（不可用时降级为进程内内存）
+1. 技术栈：Python + FastAPI + LangChain + Qdrant + Redis
+2. 核心模块：
+   - app/main.py：API 入口、学习入库、Qdrant 管理接口
+   - app/services/master_service.py：Agent 编排、工具路由、记忆管理
+   - app/llm/custom_llm.py：OpenAI 兼容网关封装（支持 tool calls）
+   - app/tools/mytools.py：工具实现（搜索、向量检索、占星、自检）
+   - app/services/qdrant_service.py：Qdrant 初始化、重建、健康检查
+3. 存储：
+   - 向量库：Qdrant（远程 URL 或本地文件）
+   - 记忆：Redis（不可用时降级进程内内存）
 
 ### 客户端
 
-1. 用户输入 -> 情绪识别 -> 角色设定
-2. Prompt 清晰度越高，Agent 响应质量越高
-3. 工具链路：用户请求 -> Agent 决策 -> 工具调用 -> 结果回填
-4. 会话隔离：通过 `session_id` 保障多用户并发安全
+1. 用户请求进入 /chat 或 /ws
+2. 系统执行情绪识别并设定角色语气
+3. Agent 根据意图自动选取工具
+4. 工具结果回填给模型生成最终回答
+5. 以 session_id 隔离多会话
 
 ### 能力列表
 
-1. API 服务
-2. Agent 框架
-3. Tools：搜索、查询信息、专业知识库
-4. 记忆（短期与长期）
-5. 学习能力
+1. 对话服务：HTTP + WebSocket
+2. 工具编排：占星、搜索、向量检索
+3. 学习能力：URL 抓取 + 切块 + 向量写入
+4. 记忆能力：会话历史压缩与回放
+5. 运维能力：健康检查、Qdrant 接口、日志追踪
 
 ---
 
@@ -55,335 +62,411 @@
 
 | 接口 | 方法 | 说明 |
 | --- | --- | --- |
-| `/chat` | POST | 主对话接口 |
-| `/add_urls` | POST | 从 URL 学习知识 |
-| `/add_pdfs` | POST | 从 PDF 学习知识 |
-| `/add_texts` | POST | 从文本学习知识 |
-| `/health` | GET | 服务健康检查 |
-| `/memory/status` | GET | 会话 memory 状态观测 |
-| `/ws` | WebSocket | 实时会话通道 |
+| /chat | POST | 主对话接口 |
+| /ws | WebSocket | 实时会话通道 |
+| /add_urls | POST | 从 URL 抓取并写入向量库 |
+| /add_urls/dry_run | POST | URL 抓取与切块预览（不写库） |
+| /add_pdfs | POST | 占位接口（待扩展） |
+| /add_texts | POST | 占位接口（待扩展） |
+| /health | GET | 服务健康检查 |
+| /memory/status | GET | 会话记忆状态 |
+| /qdrant/init | POST | 初始化集合 |
+| /qdrant/recreate | POST | 删除并重建集合 |
+| /qdrant/health | GET | Qdrant 连通性检查 |
+| /qdrant/collections | GET | 列出集合 |
 
 ### add_urls 输入示例（支持 Query 与 JSON）
 
-1. `/add_urls` JSON 方式（推荐）
+1. JSON 方式（推荐）
 
 ```json
 {
-    "urls": ["https://example.com/a", "https://example.com/b"],
-    "chunk_strategy": "balanced",
-    "chunk_size": 900,
-    "chunk_overlap": 120
+  "urls": ["https://example.com/a", "https://example.com/b"],
+  "chunk_strategy": "balanced",
+  "chunk_size": 900,
+  "chunk_overlap": 120
 }
 ```
 
-1. `/add_urls` Query 方式
+2. Query 方式
 
 ```http
 POST /add_urls?url=https://example.com/a&chunk_strategy=balanced&chunk_size=900&chunk_overlap=120
 ```
 
-1. `/add_urls` Query 方式传多个 urls（重复键）
+3. Query 方式传多个 urls（重复键）
 
 ```http
 POST /add_urls?urls=https://example.com/a&urls=https://example.com/b&chunk_strategy=article
 ```
 
-1. `/add_urls/dry_run` JSON 方式
+4. dry_run JSON 方式
 
 ```json
 {
-    "url": "https://example.com/a",
-    "chunk_strategy": "faq",
-    "preview_limit": 2
+  "url": "https://example.com/a",
+  "chunk_strategy": "faq",
+  "preview_limit": 2
 }
 ```
 
-1. `/add_urls/dry_run` Query 方式
+5. dry_run Query 方式
 
 ```http
 POST /add_urls/dry_run?url=https://example.com/a&chunk_strategy=faq&preview_limit=2
 ```
 
-说明：
+### add_urls 语义与错误约定
 
-1. 同名字段同时出现在 JSON 和 Query 时，优先使用 JSON。
-2. `url` 和 `urls` 可混用，系统会自动合并并过滤空白项。
-3. `dry_run` 只做抓取与切块预览，不写入 Qdrant。
-
----
-
-## 客户端流程
-
-1. 用户输入问题
-2. 系统判断情绪倾向（规则优先，LLM 兜底）
-3. Agent 按意图选择工具
-4. 工具返回结构化结果
-5. LLM 总结并回复用户
+1. JSON 与 Query 同名字段冲突时，优先使用 JSON。
+2. url 与 urls 可混用，系统自动合并并过滤空白项。
+3. dry_run 只预览，不写入 Qdrant。
+4. 当集合向量维度与当前 Embedding 维度不一致时，返回 HTTP 409，不再自动删库重建。
+5. 如需重建，请显式调用 /qdrant/recreate。
 
 ---
 
-## 学习能力流程
+## 核心流程
 
-1. 输入 URL
-2. 抽取 HTML 文本
-3. 文本切分与向量化
-4. 向量检索命中文本块
-5. LLM 结合检索结果作答
+### 对话流程（/chat 与 /ws）
+
+1. 校验 session_id。
+2. 识别情绪（规则优先，LLM 兜底）。
+3. 根据意图路由选择最小工具集。
+4. 组装 Prompt + Memory，执行 Agent。
+5. 记录工具调用轨迹并返回结果。
+6. 占星场景若总结失败，启用工具结果兜底摘要。
+
+### 学习流程（/add_urls）
+
+1. 归一化请求参数（支持 JSON 与 Query）。
+2. 按 chunk_strategy 构建切块配置。
+3. 用 WebBaseLoader 抓取页面内容。
+4. 文本切块并写入 metadata。
+5. 初始化 Embeddings 与 Qdrant collection。
+6. 写入向量点，返回统计信息与失败 URL。
+
+### 预览流程（/add_urls/dry_run）
+
+1. 参数归一化与切块配置。
+2. 抓取并切块。
+3. 返回 chunk 数量、失败项、预览样本。
 
 ---
 
-## Embedding 启动前自检
+## 配置规范
 
-1. 容器启动前会先执行 `python app/startup_check.py`，通过后才启动 FastAPI。
-2. 自检仅在 `EMBEDDINGS_API=local` 时生效；`openai` 模式会自动跳过。
-3. 默认开启：`EMBEDDINGS_STARTUP_CHECK=true`。
-4. 自检会校验：模型目录存在、关键文件齐全、可离线加载并输出向量。
-5. 若需临时关闭：设置 `EMBEDDINGS_STARTUP_CHECK=false`。
+### LLM 网关
+
+1. OPENAI_API_KEY：必填。
+2. OPENAI_API_BASE：期望不包含 /v1，例如 https://api.example.com。
+3. OPENAI_MODEL：必填。
+4. 运行时会自动拼接 /v1/chat/completions。
+
+### Embeddings
+
+1. EMBEDDINGS_API：openai 或 local。
+2. EMBEDDINGS_MODEL：模型名或本地路径。
+3. EMBEDDINGS_DIMENSION：向量维度（正整数）。
+4. OPENAI Embeddings 会自动基于 OPENAI_API_BASE 拼接 /v1。
+5. local 模式支持离线加载与缓存目录。
+
+### Qdrant（已统一单集合）
+
+1. QDRANT_COLLECTION：唯一集合名，/add_urls 与 vector_search 使用同一集合。
+2. QDRANT_URL：远程 Qdrant 地址（可选）。
+3. QDRANT_API_KEY：远程鉴权（可选）。
+4. QDRANT_DB_PATH：本地模式路径，默认 ./qdrant_data/qdrant.db。
+5. QDRANT_DISTANCE：cosine 或 dot 或 euclid（默认 cosine）。
+
+### 记忆与运行时
+
+1. REDIS_URL 或 REDIS_HOST/PORT/DB/PASSWORD。
+2. MEMORY_TTL：会话历史过期时间。
+3. MEMORY_COMPACT_MESSAGE_COUNT：触发历史压缩阈值。
+4. MOOD_TIMEOUT_SECONDS：情绪识别超时。
+
+### 抓取与启动检查
+
+1. WEB_LOADER_VERIFY_SSL：是否启用网页抓取 SSL 校验。
+2. EMBEDDINGS_STARTUP_CHECK：local embedding 启动前自检开关。
 
 ---
 
 ## 方法手册
 
-本章节用于代码评审、PR 描述和需求改造时快速定位：
+### main.py 关键方法
 
-1. 方法解决什么问题
-2. 方法如何实现
-3. 方法依赖哪些函数或类
+#### _resolve_add_urls_payload
 
-### server.py 核心方法
+1. 目的：统一 JSON + Query 输入。
+2. 实现：同名字段 JSON 优先，空 url 视为未提供。
+3. 依赖：FastAPI Body/Query，AddUrlsRequest。
 
-#### setup_logger
+#### _build_chunking_config
 
-- 目的：统一日志规范，输出到控制台和滚动文件。
-- 实现：读取环境变量，创建日志目录，清空 root handler 后重新挂载两类 handler。
-- 依赖：os.getenv、os.makedirs、logging.getLogger、logging.StreamHandler、logging.handlers.RotatingFileHandler。
+1. 目的：生成切块策略配置。
+2. 实现：内置 balanced/faq/article/custom 默认值并支持覆盖。
+3. 依赖：RecursiveCharacterTextSplitter。
 
-#### CustomProxyLLM._to_proxy_role
+#### _collect_chunks_from_urls
 
-- 目的：把 LangChain 消息类型转换为 OpenAI 兼容 role。
-- 实现：按映射表转换 human/ai/system/tool/function；未命中时尝试 additional_kwargs.role，再兜底 user。
-- 依赖：getattr。
+1. 目的：批量抓取并切块。
+2. 实现：逐 URL 处理，失败收集到 failed_urls。
+3. 依赖：WebBaseLoader，_chunk_documents。
 
-#### CustomProxyLLM._extract_content
+#### _build_embeddings_client
 
-- 目的：稳健解析模型响应文本。
-- 实现：校验 choices/message 后读取 content；兼容 string 与 list[dict] 两种结构。
-- 依赖：dict.get、isinstance、str.strip。
+1. 目的：创建 Embeddings 客户端。
+2. 实现：支持 openai 与 local，统一 OPENAI_API_BASE 归一化。
+3. 依赖：OpenAIEmbeddings，HuggingFaceEmbeddings。
 
-#### CustomProxyLLM._extract_tool_calls
+#### _ensure_qdrant_collection
 
-- 目的：提取并过滤 tool_calls，避免脏数据影响 Agent。
-- 实现：读取 choices[0].message.tool_calls，仅保留 function.name 合法项。
-- 依赖：dict.get、isinstance。
+1. 目的：确保集合存在且维度匹配。
+2. 实现：存在则检查维度，不匹配抛 VectorSizeMismatchError。
+3. 依赖：QdrantClient，_extract_collection_vector_size。
 
-#### CustomProxyLLM._resolve_timeout_seconds
+#### add_urls
 
-- 目的：统一超时预算，兼容请求级 deadline 裁剪。
-- 实现：读取线程上下文 request_timeout/request_deadline，计算剩余预算并设置最小超时。
-- 依赖：getattr、time.perf_counter、min、max。
+1. 目的：URL 学习入库。
+2. 实现：抓取、切块、建库校验、写入向量。
+3. 风险控制：维度冲突返回 409，避免自动删库导致数据丢失。
 
-#### CustomProxyLLM._request_completion
+#### add_urls_dry_run
 
-- 目的：实际发起模型请求并返回 content + tool_calls。
-- 实现：
-    1. 校验 api_key/base_url/model。
-    2. 构建 proxy_messages 并透传 tool_calls/tool_call_id。
-    3. 构建 data 并透传 tools/tool_choice/parallel_tool_calls。
-    4. requests.post 调用网关，按 429/5xx 重试。
-    5. 解析返回并分层处理 HTTP/Timeout/Connection/KeyError。
-- 依赖：requests.post、resp.raise_for_status、resp.json、time.sleep、_to_proxy_role、_extract_content、_extract_tool_calls、_resolve_timeout_seconds。
+1. 目的：仅预览切块效果。
+2. 实现：不写库，返回预览项与统计。
 
-#### Master._normalize_session_id
+### services/master_service.py 关键方法
 
-- 目的：会话 ID 标准化，杜绝空 session_id 导致串话。
-- 实现：strip 后校验，空值抛 ValueError。
-- 依赖：str.strip、ValueError。
+#### _get_chat_history
 
-#### Master._get_session_lock
+1. 目的：构建会话历史来源。
+2. 实现：优先 Redis，失败降级 InMemory。
 
-- 目的：同一 session 请求串行执行。
-- 实现：用字典缓存会话锁，不存在则创建。
-- 依赖：threading.Lock、dict.get。
+#### _compact_history_if_needed
 
-#### Master._extract_user_facts_from_messages
+1. 目的：控制历史体积。
+2. 实现：抽取用户事实 + 摘要压缩。
 
-- 目的：历史压缩时保留用户事实（姓名、年龄、生日、偏好等）。
-- 实现：聚合用户消息文本，按正则抽取结构化字段。
-- 依赖：re.search、getattr、isinstance。
+#### _select_tools_by_intent
 
-#### Master._get_chat_history
+1. 目的：降低工具误调用。
+2. 实现：按意图返回最小工具集。
 
-- 目的：按 session 获取历史，优先 Redis，失败降级进程内历史。
-- 实现：尝试多种 RedisChatMessageHistory 参数组合，任一成功即返回；失败回退 InMemory。
-- 依赖：RedisChatMessageHistory、_get_or_create_local_history。
+#### run
 
-#### Master._compact_history_if_needed
+1. 目的：主编排入口。
+2. 实现：会话锁、情绪识别、Agent 调用、轨迹记录、兜底输出。
 
-- 目的：历史消息达到阈值时压缩，降低上下文成本。
-- 实现：
-    1. 读取全部消息并转文本。
-    2. 提取用户事实并构建摘要提示词。
-    3. 调用 normal_llm 生成摘要（超时则退化为截断文本）。
-    4. clear 历史后写入单条摘要。
-- 依赖：ChatPromptTemplate.from_messages、StrOutputParser、_invoke_with_timeout、chat_history.clear、_append_summary_message。
+### llm/custom_llm.py 关键方法
 
-#### Master._build_memory
+#### _normalize_base_url
 
-- 目的：构建 Agent 可用会话记忆对象。
-- 实现：拉取历史并按阈值压缩，再封装为 ConversationBufferMemory。
-- 依赖：_get_chat_history、_compact_history_if_needed、ConversationBufferMemory。
+1. 目的：规范 OPENAI_API_BASE（输入不含 /v1）。
+2. 实现：去尾斜杠并剥离末尾 /v1。
 
-#### Master._route_intent + _select_tools_by_intent
+#### _request_completion
 
-- 目的：先识别意图，再裁剪工具，减少误调用与时延。
-- 实现：关键词映射意图，再按映射返回最小工具集。
-- 依赖：_match_keywords、dict.get。
+1. 目的：发起模型请求并解析 tool calls。
+2. 实现：重试 429/5xx，分层处理超时与网络错误。
 
-#### Master._invoke_with_timeout
-
-- 目的：统一函数执行超时控制。
-- 实现：写入线程上下文后执行 func；finally 清理上下文；超预算抛 TimeoutError（可携带 partial_result）。
-- 依赖：time.perf_counter、setattr、delattr、TimeoutError。
-
-#### Master._build_astro_fallback_output
-
-- 目的：占星总结失败时仍返回可读结果。
-- 实现：逆序扫描 intermediate_steps，找到占星工具结果 JSON，提取星座与片段生成兜底摘要。
-- 依赖：json.loads、json.dumps、getattr、isinstance。
-
-#### Master.mood_chain
-
-- 目的：识别用户情绪并选择对应角色设定。
-- 实现：先规则命中，未命中再走 LLM 分类链。
-- 依赖：_rule_based_mood、ChatPromptTemplate.from_template、StrOutputParser、_invoke_with_timeout。
-
-#### Master.run
-
-- 目的：主编排入口。
-- 实现：
-    1. 会话 ID 校验与会话锁。
-    2. 意图路由、情绪识别、prompt 与 memory 构建。
-    3. Agent 创建与执行。
-    4. 记录工具轨迹。
-    5. 占星场景做短答或超时兜底。
-- 依赖：_normalize_session_id、_get_session_lock、_route_intent、mood_chain、_build_memory、_select_tools_by_intent、create_openai_tools_agent、AgentExecutor、_invoke_with_timeout、_build_astro_fallback_output。
-
-#### chat / ws / memory_status
-
-- 目的：提供 HTTP、WebSocket 与 memory 观测接口。
-- 实现：chat 与 ws 都强制 session_id；memory_status 提供会话记忆状态诊断。
-- 依赖：master.run、master.run_async、master.get_memory_status、HTTPException、WebSocket。
-
-### Mytools.py 核心方法
-
-
-#### _tool_result
-
-- 目的：统一工具返回结构，方便上层稳定解析。
-- 实现：返回 ok/code/data/error 的 JSON 字符串。
-- 依赖：json.dumps。
-
-#### _normalize_birth_dt
-
-- 目的：归一化出生时间格式。
-- 实现：优先 fromisoformat，失败再按固定格式解析，仍失败返回原文。
-- 依赖：datetime.fromisoformat、datetime.strptime、strftime。
-
-#### _request_astro_api
-
-- 目的：统一封装星盘 API 调用。
-- 实现：
-    1. 读取 app_id/app_key/timeout。
-    2. 按 GET/POST 发请求。
-    3. 成功返回 _tool_result(ok=True)。
-    4. 失败按超时、HTTP、未知异常分层返回结构化错误码。
-- 依赖：_astro_base_url、requests.get、requests.post、resp.raise_for_status、resp.json、_tool_result。
+### tools/mytools.py 关键方法
 
 #### _get_vector_retriever
 
-- 目的：向量检索器惰性单例初始化。
-- 实现：双检锁 + 全局缓存，首次构建 Qdrant + Embeddings + Retriever。
-- 依赖：threading.Lock、QdrantClient、Qdrant、OpenAIEmbeddings、as_retriever。
-
-#### test
-
-- 目的：系统自检。
-- 实现：按 scope 检查 astro/vector/search 三类依赖并输出报告。
-- 依赖：_astro_base_url、_get_vector_retriever、os.getenv、json.dumps。
-
-#### search
-
-- 目的：联网实时搜索。
-- 实现：SerpAPIWrapper.run 执行查询并返回文本结果。
-- 依赖：SerpAPIWrapper。
+1. 目的：向量检索器惰性单例初始化。
+2. 实现：双检锁 + Qdrant + Embeddings。
+3. 约束：读取 QDRANT_COLLECTION，与 /add_urls 保持一致。
 
 #### vector_search
 
-- 目的：从本地向量库检索知识。
-- 实现：retriever.invoke 后拼接命中文本，空命中返回提示。
-- 依赖：_get_vector_retriever、retriever.invoke。
+1. 目的：检索知识库内容。
+2. 实现：retriever.invoke，拼接命中文本返回。
 
-#### xingpan / astro_my_sign / astro_natal_chart / astro_current_chart / astro_transit_chart
+#### _request_astro_api
 
-- 目的：提供占星相关工具能力。
-- 实现：参数校验后统一调用 _request_astro_api（或兼容函数 _call_xingpan_api）。
-- 依赖：_normalize_birth_dt、float、_request_astro_api、_call_xingpan_api。
+1. 目的：统一占星接口调用与错误码。
+2. 实现：封装 GET/POST 与超时、HTTP 错误处理。
+
+---
+
+## 测试与回归
+
+### 当前测试状态
+
+1. 已执行 pytest。
+2. 用例结果：9 passed。
+
+### 回归建议
+
+1. /add_urls 与 vector_search 的同集合联调。
+2. 维度不匹配时验证 HTTP 409 返回结构。
+3. OPENAI_API_BASE 在含 /v1 与不含 /v1 两种输入下都应正确。
+4. Redis 不可用时 memory 自动降级验证。
 
 ---
 
 ## 需求改造执行模板
 
-每次提需求建议按下面模板走，避免“只改一处”：
-
-1. 需求三元组：入口层（API/页面）- 资源层（文案/配置）- 引用层（逻辑/测试/文档）。
-2. 影响分析：会影响哪些函数和调用路径。
-3. 代码修改：按路径逐层修改并保持返回结构一致。
-4. 回归检查：
-     - HTTP 与 WS 是否行为一致。
-     - memory 与日志是否包含新增字段。
-     - 失败分支文案和错误码是否保持稳定。
+1. 需求三元组：入口层（API）- 资源层（文案/配置）- 引用层（逻辑/测试/文档）。
+2. 影响分析：梳理调用链、配置项、兼容性风险。
+3. 代码修改：按层次修改，保持返回结构稳定。
+4. 回归检查：HTTP/WS 一致性、日志可观测性、错误码稳定性。
 
 ---
 
-## Docker 端口暴露自检（Windows）
+## 项目架构图
 
-目标：仅暴露 8000，确保 6379 不对宿主机开放。
+```mermaid
+flowchart TD
+    U["Client<br>HTTP or WebSocket"] --> A["FastAPI app<br>main.py"]
 
-1. 检查 8000 监听（应有结果）
+    A --> C1["Endpoint /chat"]
+    A --> C2["Endpoint /ws"]
+    A --> C3["Endpoint /add_urls"]
+    A --> C4["Endpoint /add_urls/dry_run"]
+    A --> C5["Endpoint /qdrant/*"]
+
+    C1 --> M["Master Service<br>master_service.py"]
+    C2 --> M
+
+    M --> L["CustomProxyLLM<br>custom_llm.py"]
+    M --> T["Tools Router<br>mytools.py"]
+    M --> H["History Memory"]
+
+    H --> R[("Redis")]
+    H -.fallback.-> IM[("InMemory")]
+
+    T --> S1["Search<br>SerpAPI"]
+    T --> S2["Vector Search"]
+    T --> S3["Astro APIs"]
+
+    C3 --> W["Web Loader + Splitter"]
+    W --> E["Embeddings<br>openai or local"]
+    E --> Q[("Qdrant<br>QDRANT_COLLECTION")]
+
+    S2 --> Q
+    C5 --> Q
+
+    L --> OAI["OpenAI-Compatible Gateway<br>API Base + /v1"]
+```
+
+---
+
+## 附录 A：运维部署最小清单
+
+### A.1 最小环境变量（生产可用基线）
+
+1. OPENAI_API_KEY：模型网关密钥。
+2. OPENAI_API_BASE：网关地址，不包含 /v1。
+3. OPENAI_MODEL：模型名。
+4. QDRANT_COLLECTION：唯一集合名（学习与检索共用）。
+5. QDRANT_URL（远程模式）或 QDRANT_DB_PATH（本地模式）。
+6. EMBEDDINGS_API：openai 或 local。
+7. EMBEDDINGS_MODEL：Embedding 模型名或本地目录。
+8. EMBEDDINGS_DIMENSION：Embedding 维度。
+9. REDIS_URL（推荐）或 REDIS_HOST/REDIS_PORT/REDIS_DB/REDIS_PASSWORD。
+
+### A.2 启动前检查
+
+1. 确认 OPENAI_API_BASE 不带 /v1。
+2. 确认 QDRANT_COLLECTION 已配置且与预期一致。
+3. local Embedding 模式下，确认模型目录存在且关键文件完整。
+4. 若使用 Docker，确认网络能访问模型网关、Qdrant、Redis。
+5. 确认日志目录可写（默认 ./logs）。
+
+### A.3 上线后验收
+
+1. GET /health 返回 healthy。
+2. GET /qdrant/health 返回 ok。
+3. POST /add_urls/dry_run 返回 chunk_preview。
+4. POST /add_urls 写入成功并返回 chunks > 0。
+5. 对同一问题调用 vector_search，确认能检索到刚写入内容。
+6. GET /memory/status?session_id=demo，确认会话可读。
+
+---
+
+## 附录 B：故障排查手册
+
+### B.1 add_urls 返回 409（向量维度冲突）
+
+现象：接口返回 HTTP 409，提示 collection vector size mismatch。
+
+处理步骤：
+
+1. 查看当前 EMBEDDINGS_DIMENSION。
+2. 查看目标集合维度（Qdrant 控制台或 API）。
+3. 选择其一：
+   - 调整 EMBEDDINGS_DIMENSION 与集合一致。
+   - 调用 /qdrant/recreate 重建集合（会清空该集合数据）。
+
+### B.2 add_urls 报 500（向量写入失败）
+
+常见原因：
+
+1. Qdrant 不可达或鉴权失败。
+2. Embedding 网关不可达或密钥无效。
+3. URL 抓取成功但写入阶段异常。
+
+排查顺序：
+
+1. 先查 /qdrant/health。
+2. 再查日志中的 HTTP 状态码与错误详情。
+3. 用 /add_urls/dry_run 验证抓取与切块是否正常。
+
+### B.3 OPENAI_API_BASE 配置错误
+
+现象：模型请求出现 404 或路径异常。
+
+规则：
+
+1. 环境变量只写网关根路径，例如 https://api.edgefn.net。
+2. 代码会自动拼接 /v1/chat/completions（LLM）与 /v1（Embeddings）。
+
+### B.4 Redis 不可用导致记忆失效
+
+现象：服务可用，但会话记忆不持久。
+
+说明：
+
+1. 系统会自动降级到进程内内存，重启后历史丢失。
+2. 可通过 /memory/status 查看 memory_backend 字段确认当前后端。
+
+### B.5 vector_search 检索不到新数据
+
+重点检查：
+
+1. /add_urls 与 vector_search 是否使用同一个 QDRANT_COLLECTION。
+2. 是否写入到不同 Qdrant 实例（URL/本地路径不一致）。
+3. 是否因为集合重建导致历史数据被清空。
+
+---
+
+## 附录 C：Windows 常用运维命令
+
+### C.1 运行测试
+```powershell
+C:/ProgramData/anaconda3/envs/agentenv/python.exe -m pytest
+```
+
+### C.2 仅查看 Qdrant 相关日志（容器场景）
+
+```powershell
+docker logs qdrant --tail 200
+```
+
+### C.3 检查 8000 端口监听
 
 ```powershell
 Get-NetTCPConnection -State Listen -LocalPort 8000 -ErrorAction SilentlyContinue |
-    Select-Object LocalAddress, LocalPort, OwningProcess, State
+  Select-Object LocalAddress, LocalPort, OwningProcess, State
 ```
 
-2. 检查 6379 监听（应无结果）
+### C.4 检查 6379 是否暴露到宿主机
 
 ```powershell
 Get-NetTCPConnection -State Listen -LocalPort 6379 -ErrorAction SilentlyContinue |
-    Select-Object LocalAddress, LocalPort, OwningProcess, State
-```
-
-3. 若 6379 仍有监听，定位并清理
-
-```powershell
-# 找到占用进程
-Get-NetTCPConnection -State Listen -LocalPort 6379 -ErrorAction SilentlyContinue |
-    Select-Object -First 1 -ExpandProperty OwningProcess
-
-# 查看进程名
-Get-Process -Id <PID>
-```
-
-4. 常见清理方式
-
-```powershell
-# 如为旧 Redis 容器
-docker ps --filter "name=myredis"
-docker stop myredis
-docker rm myredis
-
-# 如为本地 Redis 服务（按实际服务名）
-Get-Service | Where-Object { $_.Name -match "redis" -or $_.DisplayName -match "redis" }
-Stop-Service <ServiceName>
-Set-Service <ServiceName> -StartupType Disabled
+  Select-Object LocalAddress, LocalPort, OwningProcess, State
 ```
