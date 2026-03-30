@@ -3,8 +3,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
+        PIP_EXTRA_INDEX_URL: "${PIP_EXTRA_INDEX_URL:-}"
+        PIP_TRUSTED_HOST: "${PIP_TRUSTED_HOST:-}"
+        PIP_DEFAULT_TIMEOUT: "${PIP_DEFAULT_TIMEOUT:-240}"
+        PIP_RETRIES: "${PIP_RETRIES:-10}"
     container_name: chatbot-agent
     restart: unless-stopped
+    command: ["sh", "-c", "python app/startup_check.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
       - "8000:8000"
     environment:
@@ -19,12 +26,20 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
       OPENAI_API_BASE: "${OPENAI_API_BASE}"
       OPENAI_MODEL: "${OPENAI_MODEL}"
+      EMBEDDINGS_API: "${EMBEDDINGS_API:-openai}"
+      EMBEDDINGS_MODEL: "${EMBEDDINGS_MODEL:-text-embedding-3-small}"
+      EMBEDDINGS_DIMENSION: "${EMBEDDINGS_DIMENSION:-}"
+      EMBEDDINGS_LOCAL_FILES_ONLY: "${EMBEDDINGS_LOCAL_FILES_ONLY:-false}"
+      EMBEDDINGS_STARTUP_CHECK: "${EMBEDDINGS_STARTUP_CHECK:-true}"
+      EMBEDDINGS_HF_ENDPOINT: "${EMBEDDINGS_HF_ENDPOINT:-}"
+      EMBEDDINGS_CACHE_DIR: "${EMBEDDINGS_CACHE_DIR:-/app/model_cache}"
       SERPAPI_API_KEY: "${SERPAPI_API_KEY:-}"
       QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
       QDRANT_API_KEY: "${QDRANT_API_KEY:-64588515}"
       XINGPAN_APP_ID: "${XINGPAN_APP_ID:-}"
       XINGPAN_APP_KEY: "${XINGPAN_APP_KEY:-}"
       ASTRO_UID: "${ASTRO_UID:-}"
+      WEB_LOADER_VERIFY_SSL: "${WEB_LOADER_VERIFY_SSL:-true}"
     depends_on:
       redis:
         condition: service_healthy
@@ -33,6 +48,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./qdrant_data:/app/qdrant_data
+      - ./model_cache:/app/model_cache
 
   redis:
     image: redis:7-alpine
@@ -44,7 +60,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-64588515}\" ping | grep PONG"]
       interval: 5s
-      timeout: 3s
+      timeout: 5s
       retries: 10
     volumes:
       - redis_data:/data

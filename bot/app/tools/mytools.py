@@ -6,20 +6,118 @@ import logging
 import threading
 import requests
 from datetime import datetime
-from dotenv import load_dotenv
 from langchain.agents import tool
 from langchain_community.utilities import SerpAPIWrapper
 from langchain_community.vectorstores import Qdrant
 from qdrant_client import QdrantClient
 from langchain_openai import OpenAIEmbeddings
-
-load_dotenv()
+from app.core import config as _app_config
 
 logger = logging.getLogger(__name__)
 
 # ===================== retriever初始化 =====================
 _vector_retriever = None
 _vector_retriever_lock = threading.Lock()
+
+
+def _resolve_embeddings_dimension(default_value: int) -> int:
+    raw = os.getenv("EMBEDDINGS_DIMENSION", "").strip()
+    if not raw:
+        return default_value
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning("EMBEDDINGS_DIMENSION 非法，已回退默认值: %s", default_value)
+    return default_value
+
+
+def _resolve_local_embedding_model(model_name: str, cache_dir: str) -> str:
+    """解析本地Embedding模型路径，兼容仓库名与本地目录。"""
+    clean_model = (model_name or "").strip()
+    if not clean_model:
+        return clean_model
+
+    if os.path.isdir(clean_model):
+        return clean_model
+
+    if cache_dir and "/" in clean_model:
+        candidate = os.path.join(cache_dir, *clean_model.split("/"))
+        if os.path.isdir(candidate):
+            return candidate
+
+    return clean_model
+
+
+def _normalize_openai_base_url(raw_base_url: str) -> str:
+    """规范化 OPENAI_API_BASE，确保配置不包含 /v1。"""
+    base = (raw_base_url or "").strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base.rstrip("/")
+
+
+def _build_embeddings_client(default_dimensions: int = 384):
+    """按 EMBEDDINGS_API 构造 Embeddings 客户端。"""
+    provider = os.getenv("EMBEDDINGS_API", "openai").strip().lower()
+    embedding_model = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-small").strip() or "text-embedding-3-small"
+
+    if provider == "local":
+        try:
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+        except Exception as e:
+            raise RuntimeError("EMBEDDINGS_API=local 需要安装 sentence-transformers") from e
+        hf_endpoint = os.getenv("EMBEDDINGS_HF_ENDPOINT", "").strip()
+        local_files_only = os.getenv("EMBEDDINGS_LOCAL_FILES_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+        cache_dir = os.getenv("EMBEDDINGS_CACHE_DIR", "").strip()
+        resolved_model = _resolve_local_embedding_model(embedding_model, cache_dir)
+
+        # 仅在 Embedding 初始化路径下设置 HF 运行时环境，避免影响其他模块。
+        if hf_endpoint and not local_files_only:
+            os.environ["HF_ENDPOINT"] = hf_endpoint.rstrip("/")
+        if local_files_only:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        if cache_dir:
+            os.environ["SENTENCE_TRANSFORMERS_HOME"] = cache_dir
+
+        model_kwargs = {"local_files_only": local_files_only}
+
+        try:
+            return HuggingFaceEmbeddings(
+                model_name=resolved_model,
+                cache_folder=(cache_dir or None),
+                model_kwargs=model_kwargs,
+                encode_kwargs={"normalize_embeddings": True},
+            )
+        except Exception as e:
+            expected_path = os.path.join(cache_dir, "BAAI", "bge-small-zh-v1.5") if cache_dir else ""
+            hint = (
+                "本地模型不可用。请先预下载模型到缓存目录，"
+                "或设置 EMBEDDINGS_HF_ENDPOINT 到可访问镜像站，"
+                "或将 EMBEDDINGS_API 切回 openai。"
+            )
+            raise RuntimeError(
+                f"初始化本地Embedding失败: {str(e)[:240]} | model={resolved_model} | expected_dir={expected_path} | {hint}"
+            ) from e
+
+    api_base = _normalize_openai_base_url(os.getenv("OPENAI_API_BASE", ""))
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    kwargs = {
+        "model": embedding_model,
+        "dimensions": _resolve_embeddings_dimension(default_dimensions),
+        # 某些代理模型不在 tiktoken 映射表中，固定编码可避免无意义告警。
+        "tiktoken_model_name": "cl100k_base",
+    }
+    if api_base:
+        kwargs["openai_api_base"] = f"{api_base}/v1"
+
+    if api_key:
+        kwargs["openai_api_key"] = api_key
+
+    return OpenAIEmbeddings(**kwargs)
 
 
 def _tool_result(ok: bool, data=None, error: str = "", code: str = "OK") -> str:
@@ -178,7 +276,7 @@ def _get_vector_retriever():
         vector_store = Qdrant(
             client,
             collection_name,
-            OpenAIEmbeddings(model="text-embedding-3-small", dimensions=384),
+            _build_embeddings_client(default_dimensions=384),
         )
         _vector_retriever = vector_store.as_retriever(
             search_type="mmr",

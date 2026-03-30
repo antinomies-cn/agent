@@ -63,6 +63,53 @@
 | `/memory/status` | GET | 会话 memory 状态观测 |
 | `/ws` | WebSocket | 实时会话通道 |
 
+### add_urls 输入示例（支持 Query 与 JSON）
+
+1. `/add_urls` JSON 方式（推荐）
+
+```json
+{
+    "urls": ["https://example.com/a", "https://example.com/b"],
+    "chunk_strategy": "balanced",
+    "chunk_size": 900,
+    "chunk_overlap": 120
+}
+```
+
+1. `/add_urls` Query 方式
+
+```http
+POST /add_urls?url=https://example.com/a&chunk_strategy=balanced&chunk_size=900&chunk_overlap=120
+```
+
+1. `/add_urls` Query 方式传多个 urls（重复键）
+
+```http
+POST /add_urls?urls=https://example.com/a&urls=https://example.com/b&chunk_strategy=article
+```
+
+1. `/add_urls/dry_run` JSON 方式
+
+```json
+{
+    "url": "https://example.com/a",
+    "chunk_strategy": "faq",
+    "preview_limit": 2
+}
+```
+
+1. `/add_urls/dry_run` Query 方式
+
+```http
+POST /add_urls/dry_run?url=https://example.com/a&chunk_strategy=faq&preview_limit=2
+```
+
+说明：
+
+1. 同名字段同时出现在 JSON 和 Query 时，优先使用 JSON。
+2. `url` 和 `urls` 可混用，系统会自动合并并过滤空白项。
+3. `dry_run` 只做抓取与切块预览，不写入 Qdrant。
+
 ---
 
 ## 客户端流程
@@ -82,6 +129,16 @@
 3. 文本切分与向量化
 4. 向量检索命中文本块
 5. LLM 结合检索结果作答
+
+---
+
+## Embedding 启动前自检
+
+1. 容器启动前会先执行 `python app/startup_check.py`，通过后才启动 FastAPI。
+2. 自检仅在 `EMBEDDINGS_API=local` 时生效；`openai` 模式会自动跳过。
+3. 默认开启：`EMBEDDINGS_STARTUP_CHECK=true`。
+4. 自检会校验：模型目录存在、关键文件齐全、可离线加载并输出向量。
+5. 若需临时关闭：设置 `EMBEDDINGS_STARTUP_CHECK=false`。
 
 ---
 

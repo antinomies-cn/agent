@@ -29,6 +29,10 @@ class CustomProxyLLM(BaseChatModel):
         """避免运行时对象被误序列化，导致多进程/拷贝路径下出现锁相关错误。"""
         raise TypeError("CustomProxyLLM is a runtime object and cannot be pickled")
 
+    def __deepcopy__(self, memo):
+        """禁止深拷贝运行时对象，避免隐式复制网络客户端与线程上下文。"""
+        raise TypeError("CustomProxyLLM is a runtime object and cannot be deep-copied")
+
     @staticmethod
     def _to_proxy_role(message: BaseMessage) -> str:
         """将LangChain消息类型映射到OpenAI兼容角色。"""
@@ -120,6 +124,14 @@ class CustomProxyLLM(BaseChatModel):
 
         return max(timeout_seconds, 3.0)
 
+    @staticmethod
+    def _normalize_base_url(raw_base_url: str) -> str:
+        """规范化 OPENAI_API_BASE，确保配置不包含 /v1。"""
+        base = (raw_base_url or "").strip().rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        return base.rstrip("/")
+
     def _request_completion(self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs) -> tuple[str, list[dict]]:
         try:
             call_start = time.perf_counter()
@@ -173,7 +185,8 @@ class CustomProxyLLM(BaseChatModel):
             if stop:
                 data["stop"] = stop
 
-            url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
+            normalized_base = self._normalize_base_url(self.base_url)
+            url = f"{normalized_base}/v1/chat/completions"
 
             if not IS_PROD:
                 logger.debug("LLM请求URL: %s", url)

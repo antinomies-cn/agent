@@ -29,6 +29,14 @@ from app.core.texts import MOOD_CLASSIFY_PROMPT, MOODS, SYSTEMPL, USER_MESSAGES
 
 
 class Master:
+    def __getstate__(self):
+        """禁止序列化运行时服务对象，避免锁与客户端对象跨进程传递。"""
+        raise TypeError("Master is a runtime service object and cannot be pickled")
+
+    def __deepcopy__(self, memo):
+        """禁止深拷贝运行时服务对象，避免误复制线程锁与内存状态。"""
+        raise TypeError("Master is a runtime service object and cannot be deep-copied")
+
     @staticmethod
     def _build_redis_url_from_env() -> str:
         """构建Redis连接地址，优先兼容REDIS_*分项配置。"""
