@@ -1,7 +1,16 @@
+import os
+import sys
 import time
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from langchain.text_splitter import RecursiveCharacterTextSplitter  
 from langchain_community.document_loaders import WebBaseLoader
+
+# 兼容 `python app/main.py` 直跑场景：把项目根目录加入模块搜索路径。
+if __package__ in (None, ""):
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
 from app.core.config import IS_PROD
 from app.core.logger_setup import logger
 from app.services.master_service import Master
