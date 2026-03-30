@@ -7,7 +7,7 @@ def _get_qdrant_client() -> QdrantClient:
     """根据环境变量创建Qdrant客户端。"""
     qdrant_url = os.getenv("QDRANT_URL", "").strip()
     qdrant_api_key = os.getenv("QDRANT_API_KEY", "").strip() or None
-    qdrant_path = os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db")
+    qdrant_path = os.getenv("QDRANT_DB_PATH", "")
 
     if qdrant_url:
         return QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
