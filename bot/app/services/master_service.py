@@ -12,7 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import ChatMessageHistory as InMemoryChatMessageHistory
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 
-from Mytools import (
+from app.tools.mytools import (
     astro_current_chart,
     astro_my_sign,
     astro_natal_chart,
@@ -22,13 +22,28 @@ from Mytools import (
     vector_search,
     xingpan,
 )
-from config import IS_PROD
-from custom_llm import CustomProxyLLM, _thread_ctx
-from logger_setup import logger
-from texts import MOOD_CLASSIFY_PROMPT, MOODS, SYSTEMPL, USER_MESSAGES
+from app.core.config import IS_PROD
+from app.llm.custom_llm import CustomProxyLLM, _thread_ctx
+from app.core.logger_setup import logger
+from app.core.texts import MOOD_CLASSIFY_PROMPT, MOODS, SYSTEMPL, USER_MESSAGES
 
 
 class Master:
+    @staticmethod
+    def _build_redis_url_from_env() -> str:
+        """构建Redis连接地址，优先兼容REDIS_*分项配置。"""
+        host = os.getenv("REDIS_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        port = os.getenv("REDIS_PORT", "6379").strip() or "6379"
+        db = os.getenv("REDIS_DB", "0").strip() or "0"
+        password = os.getenv("REDIS_PASSWORD", "")
+
+        # URL中若无密码，格式为 redis://host:port/db。
+        if not password:
+            return f"redis://{host}:{port}/{db}"
+
+        # Redis URL规范：带密码时使用 redis://:password@host:port/db。
+        return f"redis://:{password}@{host}:{port}/{db}"
+
     def __init__(self):
         self.normal_llm = CustomProxyLLM(
             api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -55,7 +70,7 @@ class Master:
             astro_transit_chart,
         ]
 
-        self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.redis_url = os.getenv("REDIS_URL", "").strip() or self._build_redis_url_from_env()
         self.memory_ttl = int(os.getenv("MEMORY_TTL", "86400"))
         self.memory_compact_message_count = int(os.getenv("MEMORY_COMPACT_MESSAGE_COUNT", "10"))
         self.mood_timeout_seconds = float(os.getenv("MOOD_TIMEOUT_SECONDS", "5"))

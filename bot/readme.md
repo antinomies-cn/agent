@@ -285,3 +285,48 @@
      - HTTP 与 WS 是否行为一致。
      - memory 与日志是否包含新增字段。
      - 失败分支文案和错误码是否保持稳定。
+
+---
+
+## Docker 端口暴露自检（Windows）
+
+目标：仅暴露 8000，确保 6379 不对宿主机开放。
+
+1. 检查 8000 监听（应有结果）
+
+```powershell
+Get-NetTCPConnection -State Listen -LocalPort 8000 -ErrorAction SilentlyContinue |
+    Select-Object LocalAddress, LocalPort, OwningProcess, State
+```
+
+2. 检查 6379 监听（应无结果）
+
+```powershell
+Get-NetTCPConnection -State Listen -LocalPort 6379 -ErrorAction SilentlyContinue |
+    Select-Object LocalAddress, LocalPort, OwningProcess, State
+```
+
+3. 若 6379 仍有监听，定位并清理
+
+```powershell
+# 找到占用进程
+Get-NetTCPConnection -State Listen -LocalPort 6379 -ErrorAction SilentlyContinue |
+    Select-Object -First 1 -ExpandProperty OwningProcess
+
+# 查看进程名
+Get-Process -Id <PID>
+```
+
+4. 常见清理方式
+
+```powershell
+# 如为旧 Redis 容器
+docker ps --filter "name=myredis"
+docker stop myredis
+docker rm myredis
+
+# 如为本地 Redis 服务（按实际服务名）
+Get-Service | Where-Object { $_.Name -match "redis" -or $_.DisplayName -match "redis" }
+Stop-Service <ServiceName>
+Set-Service <ServiceName> -StartupType Disabled
+```

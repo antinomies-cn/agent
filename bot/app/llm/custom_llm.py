@@ -6,9 +6,9 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from config import IS_PROD
-from logger_setup import logger
-from texts import USER_MESSAGES
+from app.core.config import IS_PROD
+from app.core.logger_setup import logger
+from app.core.texts import USER_MESSAGES
 
 # 线程本地上下文：为LLM请求传递每次调用的超时。
 _thread_ctx = threading.local()

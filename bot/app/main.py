@@ -2,10 +2,10 @@ import time
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from langchain.text_splitter import RecursiveCharacterTextSplitter  
 from langchain_community.document_loaders import WebBaseLoader
-from config import IS_PROD
-from logger_setup import logger
-from master_service import Master
-from texts import USER_MESSAGES
+from app.core.config import IS_PROD
+from app.core.logger_setup import logger
+from app.services.master_service import Master
+from app.core.texts import USER_MESSAGES
 
 app = FastAPI()
 master = Master()
