@@ -110,3 +110,36 @@ def qdrant_list_collections() -> dict:
     info = client.get_collections()
     collections = [c.name for c in getattr(info, "collections", []) or []]
     return {"ok": True, "collections": collections}
+
+
+def qdrant_repo_status() -> dict:
+    """简单监视Qdrant仓库状态，不改变任何配置。"""
+    qdrant_url = os.getenv("QDRANT_URL", "").strip()
+    qdrant_path = os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db")
+    mode = "remote" if qdrant_url else "local"
+
+    client = _get_qdrant_client()
+    info = client.get_collections()
+    collections = [c.name for c in getattr(info, "collections", []) or []]
+
+    status = {
+        "ok": True,
+        "mode": mode,
+        "collections_count": len(collections),
+        "collections": collections,
+    }
+
+    if mode == "remote":
+        status["qdrant_url"] = qdrant_url
+        return status
+
+    db_exists = os.path.exists(qdrant_path)
+    db_size = os.path.getsize(qdrant_path) if db_exists else 0
+    status.update(
+        {
+            "qdrant_path": qdrant_path,
+            "db_exists": db_exists,
+            "db_size_bytes": db_size,
+        }
+    )
+    return status

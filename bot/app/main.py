@@ -24,6 +24,7 @@ from app.services.qdrant_service import (
     init_qdrant_collection,
     qdrant_health,
     qdrant_list_collections,
+    qdrant_repo_status,
     recreate_qdrant_collection,
 )
 from app.core.texts import USER_MESSAGES
@@ -758,6 +759,19 @@ def qdrant_collections():
     except Exception as e:
         err = str(e)[:120]
         logger.error("Qdrant collections失败 | err: %s", err, exc_info=True)
+        return {"code": 500, "error": err}
+
+
+@app.get("/qdrant/status")
+def qdrant_status():
+    """简单监视Qdrant仓库状态。"""
+    try:
+        result = qdrant_repo_status()
+        logger.info("Qdrant status | result: %s", result)
+        return {"code": 200, "data": result}
+    except Exception as e:
+        err = str(e)[:120]
+        logger.error("Qdrant status失败 | err: %s", err, exc_info=True)
         return {"code": 500, "error": err}
 
 @app.get("/health")

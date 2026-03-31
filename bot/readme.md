@@ -74,6 +74,7 @@
 | /qdrant/recreate | POST | 删除并重建集合 |
 | /qdrant/health | GET | Qdrant 连通性检查 |
 | /qdrant/collections | GET | 列出集合 |
+| /qdrant/status | GET | Qdrant 仓库状态（轻量监视） |
 
 ### add_urls 输入示例（支持 Query 与 JSON）
 
@@ -123,6 +124,40 @@ POST /add_urls/dry_run?url=https://example.com/a&chunk_strategy=faq&preview_limi
 3. dry_run 只预览，不写入 Qdrant。
 4. 当集合向量维度与当前 Embedding 维度不一致时，返回 HTTP 409，不再自动删库重建。
 5. 如需重建，请显式调用 /qdrant/recreate。
+
+### Qdrant status 示例响应
+
+1. 本地模式
+
+```json
+{
+  "code": 200,
+  "data": {
+    "ok": true,
+    "mode": "local",
+    "collections_count": 1,
+    "collections": ["divination_master_collection"],
+    "qdrant_path": "./qdrant_data/qdrant.db",
+    "db_exists": true,
+    "db_size_bytes": 1048576
+  }
+}
+```
+
+2. 远程模式
+
+```json
+{
+  "code": 200,
+  "data": {
+    "ok": true,
+    "mode": "remote",
+    "collections_count": 2,
+    "collections": ["divination_master_collection", "docs"],
+    "qdrant_url": "https://qdrant.example.com"
+  }
+}
+```
 
 ---
 
@@ -447,6 +482,7 @@ flowchart TD
 ## 附录 C：Windows 常用运维命令
 
 ### C.1 运行测试
+
 ```powershell
 C:/ProgramData/anaconda3/envs/agentenv/python.exe -m pytest
 ```
