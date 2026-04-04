@@ -843,5 +843,10 @@ async def ws(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("启动FastAPI服务 | 地址: 127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    api_host = os.getenv("API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        api_port = int(os.getenv("API_PORT", "8000"))
+    except ValueError:
+        api_port = 8000
+    logger.info("启动FastAPI服务 | 地址: %s:%s", api_host, api_port)
+    uvicorn.run(app, host=api_host, port=api_port)
