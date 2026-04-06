@@ -1,0 +1,195 @@
+version: 1
+spec_name: chatbot-agent
+spec_type: ai-agent
+language: zh
+last_updated: 2026-04-04
+summary: >
+  基于 FastAPI + LangChain 的问答/占卜 Agent，支持 HTTP 与 WebSocket
+  对话、工具调用、URL 学习入库到 Qdrant，以及 Redis 会话记忆。
+
+architecture:
+  runtime_stack:
+    - python
+    - fastapi
+    - langchain
+    - qdrant
+    - redis
+  main_modules:
+    entry_api:
+      file: app/main.py
+      responsibilities:
+        - http 接口
+        - url 学习入库
+        - qdrant 管理接口
+    master_service:
+      file: app/services/master_service.py
+      responsibilities:
+        - agent 编排
+        - 工具路由
+        - 会话记忆
+    custom_llm:
+      file: app/llm/custom_llm.py
+      responsibilities:
+        - openai 兼容网关
+        - tool call 解析
+        - 重试与错误处理
+    tools:
+      file: app/tools/mytools.py
+      responsibilities:
+        - 搜索
+        - 向量检索
+        - 占星
+        - 自检
+    qdrant_service:
+      file: app/services/qdrant_service.py
+      responsibilities:
+        - 集合初始化
+        - 重建
+        - 健康检查
+
+interfaces:
+  http:
+    - path: /chat
+      method: POST
+      purpose: 主对话接口
+    - path: /ws
+      method: WebSocket
+      purpose: 实时会话通道
+    - path: /add_urls
+      method: POST
+      purpose: 抓取并写入向量库
+    - path: /add_urls/dry_run
+      method: POST
+      purpose: 仅预览切块，不写入向量
+    - path: /add_pdfs
+      method: POST
+      purpose: 占位接口
+    - path: /add_texts
+      method: POST
+      purpose: 占位接口
+    - path: /health
+      method: GET
+      purpose: 服务健康检查
+    - path: /memory/status
+      method: GET
+      purpose: 记忆后端状态
+    - path: /qdrant/init
+      method: POST
+      purpose: 初始化集合
+    - path: /qdrant/recreate
+      method: POST
+      purpose: 删除并重建集合
+    - path: /qdrant/health
+      method: GET
+      purpose: Qdrant 连通性检查
+    - path: /qdrant/collections
+      method: GET
+      purpose: 列出集合
+    - path: /qdrant/status
+      method: GET
+      purpose: 轻量存储状态
+
+core_flows:
+  chat_flow:
+    - 校验 session_id
+    - 识别情绪（规则优先，LLM 兜底）
+    - 按意图选择最小工具集
+    - 组装 prompt + memory
+    - 执行 agent
+    - 记录工具轨迹
+    - 占星失败时启用兜底摘要
+  ingest_flow:
+    - 归一化参数（json + query）
+    - 构建切块配置
+    - 使用 WebBaseLoader 抓取页面
+    - 切块并写入元数据
+    - 初始化 embeddings + qdrant 集合
+    - 写入向量并返回统计
+  dry_run_flow:
+    - 归一化参数
+    - 构建切块配置
+    - 抓取并切块
+    - 返回预览样本与统计
+
+configuration:
+  llm_gateway:
+    required:
+      - OPENAI_API_KEY
+      - OPENAI_API_BASE
+      - OPENAI_MODEL
+    notes:
+      - OPENAI_API_BASE 不应包含 /v1
+      - 运行时拼接 /v1/chat/completions
+  embeddings:
+    required:
+      - EMBEDDINGS_API
+      - EMBEDDINGS_MODEL
+      - EMBEDDINGS_DIMENSION
+    notes:
+      - openai 模式会在 OPENAI_API_BASE 后拼接 /v1
+      - local 模式支持离线缓存
+  qdrant:
+    required:
+      - QDRANT_COLLECTION
+    optional:
+      - QDRANT_URL
+      - QDRANT_API_KEY
+      - QDRANT_DB_PATH
+      - QDRANT_DISTANCE
+    notes:
+      - 学习与检索共用单集合
+  memory:
+    optional:
+      - REDIS_URL
+      - REDIS_HOST
+      - REDIS_PORT
+      - REDIS_DB
+      - REDIS_PASSWORD
+      - MEMORY_TTL
+      - MEMORY_COMPACT_MESSAGE_COUNT
+      - MOOD_TIMEOUT_SECONDS
+  loader:
+    optional:
+      - WEB_LOADER_VERIFY_SSL
+      - EMBEDDINGS_STARTUP_CHECK
+
+data_stores:
+  vector_store:
+    type: qdrant
+    collection_singleton: true
+  session_memory:
+    primary: redis
+    fallback: in_memory
+
+constraints:
+  - 向量维度不匹配时返回 HTTP 409，不自动重建。
+  - JSON 字段优先于 Query 同名字段。
+  - url 与 urls 可混用，合并后再去除空白。
+
+quality_and_observability:
+  logging:
+    structured: true
+  health_checks:
+    - /health
+    - /qdrant/health
+  fallback_behavior:
+    - redis 不可用 -> 进程内会话历史
+
+testing:
+  framework: pytest
+  status:
+    last_run: passed
+    tests_passed: 9
+  regression_focus:
+    - add_urls 与 vector_search 使用同一集合
+    - 维度不匹配返回 HTTP 409
+    - OPENAI_API_BASE 归一化（含 /v1 与不含 /v1）
+    - redis 降级行为
+
+non_goals:
+  - add_pdfs 实现
+  - add_texts 实现
+
+usage_notes:
+  - 确保 OPENAI_API_BASE 不包含 /v1
+  - 需要重置时显式调用 /qdrant/recreate

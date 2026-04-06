@@ -1,10 +1,18 @@
 import os
 import sys
+import logging
 
 try:
     from dotenv import load_dotenv
 except Exception:  # pragma: no cover - optional dependency in local shell
     load_dotenv = None
+
+# 兼容容器/直跑：确保项目根目录在模块搜索路径中。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
+
+from app.core.logger_setup import logger, log_event
 
 
 def _load_env_files() -> None:
@@ -45,7 +53,8 @@ def _resolve_local_model_path(model_name: str, cache_dir: str) -> str:
 
 
 def _fail(message: str) -> int:
-    print(f"[startup-check] ERROR: {message}", file=sys.stderr)
+    logger.error("startup-check error: %s", message)
+    log_event(logging.ERROR, "startup_check.error", message=message)
     return 1
 
 
@@ -54,12 +63,14 @@ def main() -> int:
 
     enabled = _is_true(os.getenv("EMBEDDINGS_STARTUP_CHECK", "true"), default=True)
     if not enabled:
-        print("[startup-check] skip: EMBEDDINGS_STARTUP_CHECK=false")
+        logger.info("startup-check skip: EMBEDDINGS_STARTUP_CHECK=false")
+        log_event(logging.INFO, "startup_check.skip", reason="EMBEDDINGS_STARTUP_CHECK=false")
         return 0
 
     provider = os.getenv("EMBEDDINGS_API", "openai").strip().lower()
     if provider != "local":
-        print(f"[startup-check] skip: EMBEDDINGS_API={provider}")
+        logger.info("startup-check skip: EMBEDDINGS_API=%s", provider)
+        log_event(logging.INFO, "startup_check.skip", reason=f"EMBEDDINGS_API={provider}")
         return 0
 
     model_name = os.getenv("EMBEDDINGS_MODEL", "").strip()
@@ -119,11 +130,22 @@ def main() -> int:
                     f"向量维度不匹配: actual={dim}, EMBEDDINGS_DIMENSION={expected_dim}"
                 )
         except ValueError:
-            print(f"[startup-check] WARN: EMBEDDINGS_DIMENSION 非法: {expected_dim_text}")
+            logger.warning("startup-check warn: EMBEDDINGS_DIMENSION invalid: %s", expected_dim_text)
+            log_event(logging.WARNING, "startup_check.warn", reason="EMBEDDINGS_DIMENSION invalid")
 
-    print(
-        "[startup-check] ok: "
-        f"provider=local model={resolved_model} local_files_only={local_files_only} dim={dim}"
+    logger.info(
+        "startup-check ok: provider=local model=%s local_files_only=%s dim=%s",
+        resolved_model,
+        local_files_only,
+        dim,
+    )
+    log_event(
+        logging.INFO,
+        "startup_check.ok",
+        provider="local",
+        model=resolved_model,
+        local_files_only=local_files_only,
+        dim=dim,
     )
     return 0
 

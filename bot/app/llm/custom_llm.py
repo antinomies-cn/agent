@@ -2,12 +2,13 @@ import os
 import time
 import threading
 import requests
+import logging
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from app.core.config import IS_PROD
-from app.core.logger_setup import logger
+from app.core.logger_setup import logger, log_event
 from app.core.texts import USER_MESSAGES
 
 # 线程本地上下文：为LLM请求传递每次调用的超时。
@@ -188,6 +189,13 @@ class CustomProxyLLM(BaseChatModel):
             normalized_base = self._normalize_base_url(self.base_url)
             url = f"{normalized_base}/v1/chat/completions"
 
+            log_event(
+                logging.INFO,
+                "llm.request",
+                model=self.model,
+                message_count=len(proxy_messages),
+            )
+
             if not IS_PROD:
                 logger.debug("LLM请求URL: %s", url)
                 logger.debug("LLM请求体: %s", data)
@@ -223,6 +231,14 @@ class CustomProxyLLM(BaseChatModel):
                         status_code,
                         sleep_seconds,
                     )
+                    log_event(
+                        logging.WARNING,
+                        "llm.retry",
+                        attempt=attempt + 1,
+                        max_retries=max_retries + 1,
+                        status_code=status_code,
+                        backoff_seconds=sleep_seconds,
+                    )
                     time.sleep(sleep_seconds)
 
             if last_http_error is not None and resp is None:
@@ -241,6 +257,14 @@ class CustomProxyLLM(BaseChatModel):
                 len(content),
                 len(tool_calls),
                 elapsed,
+            )
+            log_event(
+                logging.INFO,
+                "llm.success",
+                model=self.model,
+                tool_calls=len(tool_calls),
+                output_len=len(content),
+                elapsed_ms=int(elapsed * 1000),
             )
             return content, tool_calls
 
@@ -269,28 +293,59 @@ class CustomProxyLLM(BaseChatModel):
                 user_msg = USER_MESSAGES["http"]["default"]
 
             logger.error("%s | 详细信息: %s", error_log, error_info)
+            log_event(
+                logging.ERROR,
+                "llm.http_error",
+                status_code=status_code,
+                error=str(e)[:120],
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
             return user_msg, []
 
         except requests.exceptions.Timeout:
             timeout_seconds = self._resolve_timeout_seconds()
             error_info = {"type": "TIMEOUT", "timeout": timeout_seconds}
             logger.error("LLM调用超时（%s秒） | 详细信息: %s", timeout_seconds, error_info)
+            log_event(
+                logging.ERROR,
+                "llm.timeout",
+                timeout_seconds=timeout_seconds,
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
             return USER_MESSAGES["timeout"], []
 
         except requests.exceptions.ConnectionError:
             error_info = {"type": "CONNECTION_ERROR", "url": url if "url" in locals() else ""}
             logger.error("LLM调用失败：网络连接异常 | 详细信息: %s", error_info)
+            log_event(
+                logging.ERROR,
+                "llm.connection_error",
+                error=str(error_info)[:200],
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
             return USER_MESSAGES["connection_error"], []
 
         except KeyError as e:
             response_text = resp.text[:200] if "resp" in locals() else ""
             error_info = {"type": "KEY_ERROR", "missing_key": str(e), "response_text": response_text}
             logger.error("LLM响应解析失败：缺失字段 %s | 详细信息: %s", e, error_info)
+            log_event(
+                logging.ERROR,
+                "llm.parse_error",
+                missing_key=str(e),
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
             return USER_MESSAGES["key_error"], []
 
         except Exception as e:
             error_info = {"type": "UNKNOWN_ERROR", "error": str(e)[:100]}
             logger.error("LLM未知异常 | 详细信息: %s", error_info, exc_info=True)
+            log_event(
+                logging.ERROR,
+                "llm.error",
+                error=str(e)[:200],
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
             return USER_MESSAGES["unknown_error"], []
 
     def _generate(self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs) -> ChatResult:

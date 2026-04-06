@@ -12,6 +12,7 @@ from langchain_community.vectorstores import Qdrant
 from qdrant_client import QdrantClient
 from langchain_openai import OpenAIEmbeddings
 from app.core import config as _app_config
+from app.core.logger_setup import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +87,19 @@ def _build_embeddings_client(default_dimensions: int = 384):
         model_kwargs = {"local_files_only": local_files_only}
 
         try:
-            return HuggingFaceEmbeddings(
+            client = HuggingFaceEmbeddings(
                 model_name=resolved_model,
                 cache_folder=(cache_dir or None),
                 model_kwargs=model_kwargs,
                 encode_kwargs={"normalize_embeddings": True},
             )
+            log_event(
+                logging.INFO,
+                "embeddings.init",
+                provider="local",
+                model=resolved_model,
+            )
+            return client
         except Exception as e:
             expected_path = os.path.join(cache_dir, "BAAI", "bge-small-zh-v1.5") if cache_dir else ""
             hint = (
@@ -117,7 +125,15 @@ def _build_embeddings_client(default_dimensions: int = 384):
     if api_key:
         kwargs["openai_api_key"] = api_key
 
-    return OpenAIEmbeddings(**kwargs)
+    client = OpenAIEmbeddings(**kwargs)
+    log_event(
+        logging.INFO,
+        "embeddings.init",
+        provider="openai",
+        model=embedding_model,
+        dimensions=kwargs.get("dimensions"),
+    )
+    return client
 
 
 def _tool_result(ok: bool, data=None, error: str = "", code: str = "OK") -> str:
@@ -185,6 +201,7 @@ def _request_astro_api(path: str, method: str = "POST", payload: dict | None = N
         "Content-Type": "application/json",
     }
 
+    start_time = time.perf_counter()
     try:
         m = (method or "POST").upper()
         if m == "GET":
@@ -195,9 +212,24 @@ def _request_astro_api(path: str, method: str = "POST", payload: dict | None = N
 
         data = resp.json()
         logger.info("执行星盘接口成功 | method: %s | path: %s", m, path)
+        log_event(
+            logging.INFO,
+            "astro.request",
+            method=m,
+            path=path,
+            status_code=resp.status_code,
+            elapsed_ms=int((time.perf_counter() - start_time) * 1000),
+        )
         return _tool_result(ok=True, code="OK", data=data)
     except requests.exceptions.Timeout:
         logger.error("星盘接口超时 | method: %s | path: %s", method, path)
+        log_event(
+            logging.ERROR,
+            "astro.request.timeout",
+            method=method,
+            path=path,
+            elapsed_ms=int((time.perf_counter() - start_time) * 1000),
+        )
         return _tool_result(ok=False, code="TIMEOUT", error="星盘服务响应超时，请稍后再试。")
     except requests.exceptions.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else 0
@@ -213,6 +245,14 @@ def _request_astro_api(path: str, method: str = "POST", payload: dict | None = N
             path,
             body,
         )
+        log_event(
+            logging.ERROR,
+            "astro.request.http_error",
+            method=method,
+            path=path,
+            status_code=status_code,
+            elapsed_ms=int((time.perf_counter() - start_time) * 1000),
+        )
         return _tool_result(
             ok=False,
             code=f"HTTP_{status_code}",
@@ -226,6 +266,14 @@ def _request_astro_api(path: str, method: str = "POST", payload: dict | None = N
             path,
             str(e)[:200],
             exc_info=True,
+        )
+        log_event(
+            logging.ERROR,
+            "astro.request.error",
+            method=method,
+            path=path,
+            error=str(e)[:200],
+            elapsed_ms=int((time.perf_counter() - start_time) * 1000),
         )
         return _tool_result(ok=False, code="UNKNOWN_ERROR", error="星盘服务暂时不可用，请稍后再试。")
 
@@ -266,6 +314,7 @@ def _get_vector_retriever():
         except ValueError:
             top_k = 4
 
+        init_start = time.perf_counter()
         if qdrant_url:
             client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
             mode = "remote"
@@ -289,6 +338,14 @@ def _get_vector_retriever():
             qdrant_url or "",
             collection_name,
             max(1, top_k),
+        )
+        log_event(
+            logging.INFO,
+            "vector_retriever.init",
+            mode=mode,
+            collection=collection_name,
+            top_k=max(1, top_k),
+            elapsed_ms=int((time.perf_counter() - init_start) * 1000),
         )
         return _vector_retriever
 
@@ -399,12 +456,25 @@ def search(query: str) -> str:
         return "请输入需要搜索的问题。"
 
     try:
+        start_time = time.perf_counter()
         serp = SerpAPIWrapper()
         result = serp.run(clean_query)
         logger.info(f"执行搜索工具 | 查询: {clean_query[:50]} | 结果: {str(result)[:100]}")
+        log_event(
+            logging.INFO,
+            "tool.search",
+            query_len=len(clean_query),
+            elapsed_ms=int((time.perf_counter() - start_time) * 1000),
+        )
         return str(result)
     except Exception as e:
         logger.error(f"搜索工具异常 | 查询: {clean_query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
+        log_event(
+            logging.ERROR,
+            "tool.search.error",
+            query_len=len(clean_query),
+            error=str(e)[:160],
+        )
         return "搜索服务暂时不可用，请稍后重试。"
 
 @tool
@@ -415,6 +485,7 @@ def vector_search(query: str) -> str:
         return "请输入需要检索的问题。"
 
     try:
+        start_time = time.perf_counter()
         retriever = _get_vector_retriever()
         docs = retriever.invoke(clean_query)
         result = "\n\n".join(
@@ -423,12 +494,32 @@ def vector_search(query: str) -> str:
 
         if not result:
             logger.info(f"执行向量搜索工具 | 查询: {clean_query[:50]} | 命中: 0")
+            log_event(
+                logging.INFO,
+                "tool.vector_search",
+                query_len=len(clean_query),
+                hit_count=0,
+                elapsed_ms=int((time.perf_counter() - start_time) * 1000),
+            )
             return "未检索到相关内容。"
 
         logger.info(f"执行向量搜索工具 | 查询: {clean_query[:50]} | 结果长度: {len(result)}")
+        log_event(
+            logging.INFO,
+            "tool.vector_search",
+            query_len=len(clean_query),
+            hit_count=len(docs) if docs is not None else 0,
+            elapsed_ms=int((time.perf_counter() - start_time) * 1000),
+        )
         return result
     except Exception as e:
         logger.error(f"向量搜索工具异常 | 查询: {clean_query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
+        log_event(
+            logging.ERROR,
+            "tool.vector_search.error",
+            query_len=len(clean_query),
+            error=str(e)[:160],
+        )
         return "向量检索暂时不可用，请稍后重试。"
 
 @tool

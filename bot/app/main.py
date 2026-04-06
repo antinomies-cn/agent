@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import logging
+import requests
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from langchain.text_splitter import RecursiveCharacterTextSplitter  
@@ -18,7 +20,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, project_root)
 
 from app.core.config import IS_PROD
-from app.core.logger_setup import logger
+from app.core.logger_setup import logger, log_event
 from app.services.master_service import Master
 from app.services.qdrant_service import (
     init_qdrant_collection,
@@ -94,6 +96,7 @@ class AddUrlsResponse(BaseModel):
     failed_urls: List[FailedUrlItem]
     chunk_strategy: Literal["balanced", "faq", "article", "custom"]
     chunk_config: ChunkConfigModel
+    quality_report: Dict[str, Any]
 
 
 class AddUrlsDryRunResponse(BaseModel):
@@ -111,6 +114,7 @@ class AddUrlsDryRunResponse(BaseModel):
     chunk_strategy: Literal["balanced", "faq", "article", "custom"]
     chunk_config: ChunkConfigModel
     chunk_preview: List[ChunkPreviewItem]
+    quality_report: Dict[str, Any]
 
 
 def _resolve_add_urls_payload(
@@ -243,6 +247,100 @@ def _collect_chunks_from_urls(clean_url_list: List[str], chunk_cfg: Dict[str, An
     return all_chunks, failed_urls
 
 
+def _compute_chunk_quality_report(chunks: List[Any], failed_urls: List[dict], min_len: int = 120) -> Dict[str, Any]:
+    """基于规则的切块质量报告，输出简洁可读的评分与指标。"""
+    total = len(chunks)
+    if total == 0:
+        return {
+            "score": 0,
+            "label": "poor",
+            "stats": {
+                "chunks": 0,
+                "failed_urls": len(failed_urls),
+            },
+            "signals": ["no_chunks"],
+        }
+
+    lengths = []
+    empty_chunks = 0
+    short_chunks = 0
+    bad_end_chunks = 0
+    symbols = {",", "，", ".", "。", "!", "！", "?", "？", ";", "；", ":", "：", "…"}
+
+    for chunk in chunks:
+        content = (getattr(chunk, "page_content", "") or "").strip()
+        if not content:
+            empty_chunks += 1
+            continue
+        length = len(content)
+        lengths.append(length)
+        if length < min_len:
+            short_chunks += 1
+        if content[-1] not in symbols:
+            bad_end_chunks += 1
+
+    chunks_count = len(chunks)
+    empty_ratio = empty_chunks / chunks_count
+    short_ratio = short_chunks / chunks_count
+    bad_end_ratio = bad_end_chunks / chunks_count
+
+    avg_len = int(sum(lengths) / len(lengths)) if lengths else 0
+    min_len_val = min(lengths) if lengths else 0
+    max_len_val = max(lengths) if lengths else 0
+
+    score = 100
+    score -= int(empty_ratio * 100) * 3
+    score -= int(short_ratio * 100) * 2
+    score -= int(bad_end_ratio * 100) * 2
+    score = max(0, min(100, score))
+
+    if score >= 85:
+        label = "good"
+    elif score >= 70:
+        label = "fair"
+    else:
+        label = "poor"
+
+    signals = []
+    if empty_ratio > 0.01:
+        signals.append("empty_chunks")
+    if short_ratio > 0.15:
+        signals.append("too_many_short")
+    if bad_end_ratio > 0.3:
+        signals.append("mid_sentence_cut")
+    if failed_urls:
+        signals.append("fetch_failed")
+
+    suggestions = []
+    if empty_ratio > 0.01:
+        suggestions.append("检查抓取来源，过滤无正文页面或广告脚本")
+    if short_ratio > 0.15:
+        suggestions.append("尝试提高 chunk_size 或降低 chunk_overlap")
+    if bad_end_ratio > 0.3:
+        suggestions.append("调整 separators，使切分优先落在句号/问号/换行")
+    if failed_urls:
+        suggestions.append("检查失败 URL 的可访问性与 SSL 配置")
+    if score < 70 and not suggestions:
+        suggestions.append("整体质量偏低，建议微调 chunk_size 与 separators 再评估")
+
+    return {
+        "score": score,
+        "label": label,
+        "stats": {
+            "chunks": chunks_count,
+            "failed_urls": len(failed_urls),
+            "avg_len": avg_len,
+            "min_len": min_len_val,
+            "max_len": max_len_val,
+            "empty_ratio": round(empty_ratio, 3),
+            "short_ratio": round(short_ratio, 3),
+            "bad_end_ratio": round(bad_end_ratio, 3),
+        },
+        "signals": signals,
+        "suggestions": suggestions,
+    }
+
+
 def _resolve_embeddings_dimension(default_value: int) -> int:
     raw = os.getenv("EMBEDDINGS_DIMENSION", "").strip()
     if not raw:
@@ -305,6 +403,44 @@ def _extract_collection_vector_size(collection_info: Any) -> Optional[int]:
             if isinstance(size, int) and size > 0:
                 return size
 
+    return None
+
+
+def _fetch_collection_vector_size_via_http(collection_name: str) -> Optional[int]:
+    qdrant_url = os.getenv("QDRANT_URL", "").strip()
+    if not qdrant_url:
+        return None
+
+    api_key = os.getenv("QDRANT_API_KEY", "").strip()
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["api-key"] = api_key
+
+    url = f"{qdrant_url.rstrip('/')}/collections/{collection_name}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=6)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:
+        logger.warning("Qdrant HTTP元数据读取失败 | collection: %s | err: %s", collection_name, str(e)[:160])
+        return None
+
+    result = payload.get("result", payload)
+    config = result.get("config") if isinstance(result, dict) else None
+    params = config.get("params") if isinstance(config, dict) else None
+    vectors = params.get("vectors") if isinstance(params, dict) else None
+    if vectors is None:
+        return None
+
+    if isinstance(vectors, dict):
+        size = vectors.get("size")
+        if isinstance(size, int) and size > 0:
+            return size
+        for vector_cfg in vectors.values():
+            if isinstance(vector_cfg, dict):
+                vsize = vector_cfg.get("size")
+                if isinstance(vsize, int) and vsize > 0:
+                    return vsize
     return None
 
 
@@ -377,11 +513,17 @@ def _ensure_qdrant_collection(client: QdrantClient, collection_name: str, vector
             existing_size = _extract_collection_vector_size(info)
         except Exception as e:
             logger.warning(
-                "读取Qdrant集合元数据失败，跳过预检并在写入阶段兜底 | collection: %s | err: %s",
+                "读取Qdrant集合元数据失败，尝试HTTP兜底 | collection: %s | err: %s",
                 collection_name,
                 str(e)[:160],
             )
-            return
+            existing_size = _fetch_collection_vector_size_via_http(collection_name)
+            if existing_size is None:
+                logger.warning(
+                    "HTTP兜底仍失败，跳过预检并在写入阶段兜底 | collection: %s",
+                    collection_name,
+                )
+                return
 
         if existing_size and existing_size != vector_size:
             raise VectorSizeMismatchError(
@@ -517,10 +659,18 @@ def chat(query: str, session_id: str):
 
 @app.post("/add_urls", response_model=AddUrlsResponse)
 def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> AddUrlsResponse:
+    overall_start = time.perf_counter()
     clean_url_list = _normalize_urls(payload)
 
     if not clean_url_list:
         raise HTTPException(status_code=400, detail="请提供url或urls参数")
+
+    log_event(
+        logging.INFO,
+        "add_urls.start",
+        url_count=len(clean_url_list),
+        strategy=payload.chunk_strategy,
+    )
 
     chunk_cfg = _build_chunking_config(
         strategy=payload.chunk_strategy,
@@ -529,7 +679,18 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
         separators=payload.separators,
     )
 
+    collect_start = time.perf_counter()
     all_chunks, failed_urls = _collect_chunks_from_urls(clean_url_list, chunk_cfg, payload.chunk_strategy)
+    quality_report = _compute_chunk_quality_report(all_chunks, failed_urls)
+    collect_ms = int((time.perf_counter() - collect_start) * 1000)
+    log_event(
+        logging.INFO,
+        "add_urls.collect",
+        url_count=len(clean_url_list),
+        chunks=len(all_chunks),
+        failed=len(failed_urls),
+        elapsed_ms=collect_ms,
+    )
 
     if not all_chunks:
         raise HTTPException(
@@ -555,14 +716,30 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
 
     # 使用已创建的 QdrantClient 实例，避免 from_documents 在不同版本中的参数兼容问题。
     try:
+        embeddings_start = time.perf_counter()
         embeddings_client = _build_embeddings_client(vector_size=vector_size)
         effective_vector_size = _resolve_embedding_output_dim(embeddings_client, default_size=vector_size)
+        log_event(
+            logging.INFO,
+            "add_urls.embeddings.init",
+            provider=os.getenv("EMBEDDINGS_API", "openai").strip().lower(),
+            vector_size=effective_vector_size,
+            elapsed_ms=int((time.perf_counter() - embeddings_start) * 1000),
+        )
 
         try:
+            ensure_start = time.perf_counter()
             _ensure_qdrant_collection(
                 client=client,
                 collection_name=collection_name,
                 vector_size=effective_vector_size,
+            )
+            log_event(
+                logging.INFO,
+                "add_urls.qdrant.ensure",
+                collection=collection_name,
+                mode=mode,
+                elapsed_ms=int((time.perf_counter() - ensure_start) * 1000),
             )
         except VectorSizeMismatchError as mismatch_err:
             raise HTTPException(
@@ -582,7 +759,16 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
             embeddings_client,
         )
         try:
+            write_start = time.perf_counter()
             vector_store.add_documents(all_chunks)
+            log_event(
+                logging.INFO,
+                "add_urls.qdrant.write",
+                collection=collection_name,
+                mode=mode,
+                chunks=len(all_chunks),
+                elapsed_ms=int((time.perf_counter() - write_start) * 1000),
+            )
         except Exception as write_err:
             if _is_vector_dim_mismatch_error(write_err):
                 raise HTTPException(
@@ -619,6 +805,16 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
         chunk_cfg["chunk_size"],
         chunk_cfg["chunk_overlap"],
     )
+    log_event(
+        logging.INFO,
+        "add_urls.done",
+        mode=mode,
+        collection=collection_name,
+        url_count=len(clean_url_list),
+        chunks=len(all_chunks),
+        failed=len(failed_urls),
+        elapsed_ms=int((time.perf_counter() - overall_start) * 1000),
+    )
     return AddUrlsResponse(
         response="URLs added!",
         collection=collection_name,
@@ -632,12 +828,14 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
             chunk_overlap=chunk_cfg["chunk_overlap"],
             separators=chunk_cfg["separators"],
         ),
+        quality_report=quality_report,
     )
 
 
 @app.post("/add_urls/dry_run", response_model=AddUrlsDryRunResponse)
 def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> AddUrlsDryRunResponse:
     """仅抓取和切块预览，不写入Qdrant。"""
+    overall_start = time.perf_counter()
     clean_url_list = _normalize_urls(payload)
     if not clean_url_list:
         raise HTTPException(status_code=400, detail="请提供url或urls参数")
@@ -648,7 +846,17 @@ def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload
         chunk_overlap=payload.chunk_overlap,
         separators=payload.separators,
     )
+    collect_start = time.perf_counter()
     all_chunks, failed_urls = _collect_chunks_from_urls(clean_url_list, chunk_cfg, payload.chunk_strategy)
+    quality_report = _compute_chunk_quality_report(all_chunks, failed_urls)
+    log_event(
+        logging.INFO,
+        "add_urls.dry_run.collect",
+        url_count=len(clean_url_list),
+        chunks=len(all_chunks),
+        failed=len(failed_urls),
+        elapsed_ms=int((time.perf_counter() - collect_start) * 1000),
+    )
 
     if not all_chunks:
         raise HTTPException(
@@ -681,6 +889,14 @@ def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload
         chunk_cfg["chunk_size"],
         chunk_cfg["chunk_overlap"],
     )
+    log_event(
+        logging.INFO,
+        "add_urls.dry_run.done",
+        url_count=len(clean_url_list),
+        chunks=len(all_chunks),
+        failed=len(failed_urls),
+        elapsed_ms=int((time.perf_counter() - overall_start) * 1000),
+    )
 
     return AddUrlsDryRunResponse(
         response="Dry run completed",
@@ -694,6 +910,7 @@ def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload
             separators=chunk_cfg["separators"],
         ),
         chunk_preview=[ChunkPreviewItem(**item) for item in chunk_preview],
+        quality_report=quality_report,
     )
 
 @app.post("/add_pdfs")
@@ -822,11 +1039,19 @@ async def ws(websocket: WebSocket):
         logger.warning("WebSocket连接拒绝 | 客户端IP: %s | 原因: session_id不能为空", client_ip)
         await websocket.close(code=1008, reason="session_id不能为空")
         return
+    ws_start = time.perf_counter()
     logger.info(f"WebSocket连接建立 | 客户端IP: {client_ip} | session_id: {session_id}")
+    log_event(
+        logging.INFO,
+        "ws.open",
+        client_ip=client_ip,
+        session_id=session_id,
+    )
     
     try:
         while True:
             data = await websocket.receive_text()
+            msg_start = time.perf_counter()
             logger.info(f"WebSocket接收消息 | 客户端IP: {client_ip} | session_id: {session_id} | 消息: {data[:100]}")
             
             res = await master.run_async(data, session_id=session_id)
@@ -834,11 +1059,35 @@ async def ws(websocket: WebSocket):
             
             await websocket.send_text(clean_response)
             logger.info(f"WebSocket发送消息 | 客户端IP: {client_ip} | 响应长度: {len(clean_response)}")
+            log_event(
+                logging.INFO,
+                "ws.message",
+                client_ip=client_ip,
+                session_id=session_id,
+                input_len=len(data),
+                output_len=len(clean_response),
+                elapsed_ms=int((time.perf_counter() - msg_start) * 1000),
+            )
             
     except WebSocketDisconnect:
         logger.info(f"WebSocket连接断开 | 客户端IP: {client_ip}")
+        log_event(
+            logging.INFO,
+            "ws.close",
+            client_ip=client_ip,
+            session_id=session_id,
+            elapsed_ms=int((time.perf_counter() - ws_start) * 1000),
+        )
     except Exception as e:
         logger.error(f"WebSocket异常 | 客户端IP: {client_ip} | 错误: {str(e)[:100]}", exc_info=True)
+        log_event(
+            logging.ERROR,
+            "ws.error",
+            client_ip=client_ip,
+            session_id=session_id,
+            error=str(e)[:160],
+            elapsed_ms=int((time.perf_counter() - ws_start) * 1000),
+        )
         await websocket.close(code=1011, reason="服务器内部错误")
 
 if __name__ == "__main__":

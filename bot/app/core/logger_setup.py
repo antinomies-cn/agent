@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 import logging.handlers
@@ -46,3 +47,10 @@ def setup_logger():
 
 
 logger = setup_logger()
+
+
+def log_event(level: int, event: str, **fields) -> None:
+    payload = {"event": event}
+    for key, value in fields.items():
+        payload[key] = value
+    logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
