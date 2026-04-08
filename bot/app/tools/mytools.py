@@ -382,7 +382,7 @@ def test(scope: str = "all") -> str:
             missing.append("XINGPAN_APP_KEY")
             astro_ok = False
 
-        uid = (os.getenv("ASTRO_UID", "") or os.getenv("UID", "")).strip()
+        uid = os.getenv("ASTRO_UID", "").strip()
         timeout_text = os.getenv("XINGPAN_TIMEOUT", "15")
         try:
             timeout_seconds = float(timeout_text)
@@ -392,17 +392,36 @@ def test(scope: str = "all") -> str:
         probe_ok = False
         probe_msg = ""
         if astro_ok and uid:
-            try:
-                probe_raw = _request_astro_api(f"mySign/{uid}", method="GET")
-                probe_data = json.loads(probe_raw)
-                probe_ok = bool(probe_data.get("ok"))
-                probe_msg = probe_data.get("code", "") if isinstance(probe_data, dict) else ""
-                astro_ok = astro_ok and probe_ok
-            except Exception as e:
-                probe_msg = str(e)[:120]
-                astro_ok = False
+            probe_birth_dt = os.getenv("ASTRO_BIRTH_DT", "").strip()
+            probe_lng = os.getenv("ASTRO_LONGITUDE", "").strip()
+            probe_lat = os.getenv("ASTRO_LATITUDE", "").strip()
+            if not (probe_birth_dt and probe_lng and probe_lat):
+                probe_msg = "缺少 ASTRO_BIRTH_DT/ASTRO_LONGITUDE/ASTRO_LATITUDE，跳过接口探测"
+            else:
+                clean_birth_dt = _normalize_birth_dt(probe_birth_dt)
+                if not clean_birth_dt:
+                    probe_msg = "ASTRO_BIRTH_DT 格式无效，跳过接口探测"
+                else:
+                    try:
+                        lng = float(probe_lng)
+                        lat = float(probe_lat)
+                        payload = {
+                            "birth_dt": clean_birth_dt,
+                            "longitude": lng,
+                            "latitude": lat,
+                        }
+                        probe_raw = _request_astro_api(f"mySign/{uid}", method="POST", payload=payload)
+                        probe_data = json.loads(probe_raw)
+                        probe_ok = bool(probe_data.get("ok"))
+                        probe_msg = probe_data.get("code", "") if isinstance(probe_data, dict) else ""
+                        astro_ok = astro_ok and probe_ok
+                    except (TypeError, ValueError):
+                        probe_msg = "ASTRO_LONGITUDE/ASTRO_LATITUDE 格式无效，跳过接口探测"
+                    except Exception as e:
+                        probe_msg = str(e)[:120]
+                        astro_ok = False
         elif astro_ok and not uid:
-            probe_msg = "缺少 ASTRO_UID/UID，跳过接口探测"
+            probe_msg = "缺少 ASTRO_UID，跳过接口探测"
 
         report["checks"]["astro"] = {
             "ok": astro_ok,
@@ -547,13 +566,28 @@ def xingpan(name: str, birth_dt: str, longitude: float, latitude: float) -> str:
 
 
 @tool
-def astro_my_sign() -> str:
+def astro_my_sign(birth_dt: str, longitude: float, latitude: float) -> str:
     """星座信息工具：当用户查询星座信息时使用。uid 从 .env 读取。"""
-    uid = os.getenv("ASTRO_UID", "") or os.getenv("UID", "")
+    uid = os.getenv("ASTRO_UID", "")
     uid = uid.strip()
     if not uid:
-        return "请在 .env 中配置 ASTRO_UID（或 UID）后再查询星座信息。"
-    return _request_astro_api(f"mySign/{uid}", method="GET")
+        return "请在 .env 中配置 ASTRO_UID 后再查询星座信息。"
+
+    clean_birth_dt = _normalize_birth_dt((birth_dt or "").strip())
+    if not clean_birth_dt:
+        return "请先提供出生时间，格式示例：1999-10-17 21:00:00。"
+    try:
+        lng = float(longitude)
+        lat = float(latitude)
+    except (TypeError, ValueError):
+        return "经纬度格式有误，请提供数字类型的 longitude 和 latitude。"
+
+    payload = {
+        "birth_dt": clean_birth_dt,
+        "longitude": lng,
+        "latitude": lat,
+    }
+    return _request_astro_api(f"mySign/{uid}", method="POST", payload=payload)
 
 
 @tool
@@ -600,5 +634,35 @@ def astro_transit_chart(birth_dt: str, longitude: float, latitude: float) -> str
         "latitude": lat,
     }
     return _request_astro_api("chart/transit", method="POST", payload=payload)
+
+
+@tool
+def astro_day_scope() -> str:
+    """日运势工具：读取 ASTRO_UID 获取日运势。"""
+    uid = os.getenv("ASTRO_UID", "")
+    uid = uid.strip()
+    if not uid:
+        return "请在 .env 中配置 ASTRO_UID 后再查询日运势。"
+    return _request_astro_api(f"scope/day/{uid}", method="GET")
+
+
+@tool
+def astro_week_scope() -> str:
+    """周运势工具：读取 ASTRO_UID 获取周运势。"""
+    uid = os.getenv("ASTRO_UID", "")
+    uid = uid.strip()
+    if not uid:
+        return "请在 .env 中配置 ASTRO_UID 后再查询周运势。"
+    return _request_astro_api(f"scope/week/{uid}", method="GET")
+
+
+@tool
+def astro_month_scope() -> str:
+    """月运势工具：读取 ASTRO_UID 获取月运势。"""
+    uid = os.getenv("ASTRO_UID", "")
+    uid = uid.strip()
+    if not uid:
+        return "请在 .env 中配置 ASTRO_UID 后再查询月运势。"
+    return _request_astro_api(f"scope/month/{uid}", method="GET")
 
 

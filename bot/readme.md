@@ -226,6 +226,25 @@ POST /add_urls/dry_run?url=https://example.com/a&chunk_strategy=faq&preview_limi
 1. WEB_LOADER_VERIFY_SSL：是否启用网页抓取 SSL 校验。
 2. EMBEDDINGS_STARTUP_CHECK：local embedding 启动前自检开关。
 
+### 占星接口本地连通性（Windows curl）
+
+1. POST `mySign/{uid}`：必须传 JSON body（birth_dt/longitude/latitude）。
+2. POST `chart/natal`：必须传 JSON body，PowerShell 建议用 here-string 或文件避免转义问题。
+
+示例（PowerShell）：
+
+```powershell
+$body = @'
+{"birth_dt":"1999-10-17 21:00:00","longitude":116.4074,"latitude":39.9042}
+'@
+
+curl.exe -sS -X POST "https://cloud.apiworks.com/open/astro/mySign/$env:ASTRO_UID" `
+  -H "X-App-Id: $env:XINGPAN_APP_ID" `
+  -H "X-App-Key: $env:XINGPAN_APP_KEY" `
+  -H "Content-Type: application/json" `
+  --data-binary $body
+```
+
 ---
 
 ## 方法手册

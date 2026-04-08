@@ -15,7 +15,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      ENV: "prod"
+      ENV: "dev"
       REDIS_HOST: "myredis"
       REDIS_PORT: "6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD:-64588515}"

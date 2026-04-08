@@ -26,9 +26,12 @@ from app.core.logger_setup import logger, log_event
 from app.services.master_service import Master
 from app.tools.mytools import (
     astro_current_chart,
+    astro_day_scope,
+    astro_month_scope,
     astro_my_sign,
     astro_natal_chart,
     astro_transit_chart,
+    astro_week_scope,
     search,
     test,
     vector_search,
@@ -707,13 +710,15 @@ def _build_embeddings_client(vector_size: int):
 
     return OpenAIEmbeddings(**embedding_kwargs)
 
-@app.get("/")
+@app.get("/", summary="根路径", description="基础连通性检查，返回简单响应。")
 def read_root():
+    """根路径响应，用于快速确认服务存活。"""
     logger.info("访问根路径")
     return {"Hello": "World"}
 
-@app.post("/chat")
+@app.post("/chat", summary="对话接口", description="主对话入口。query 为用户输入，session_id 用于会话隔离。")
 def chat(query: str, session_id: str):
+    """处理一次对话请求并返回模型回复。"""
     logger.info(f"接收Chat API请求 | session_id: {session_id} | 查询: {query[:100]}")
     if not session_id.strip():
         raise HTTPException(status_code=400, detail="session_id不能为空")
@@ -731,50 +736,81 @@ def chat(query: str, session_id: str):
 @app.post("/tools/test", summary="工具调试：系统自检", description="调用 test 工具，支持 scope=all|astro|vector|search 用于快速排查配置。")
 def debug_tool_test(payload: ToolTestRequest = Body(...)):
     _ensure_debug_tools_enabled()
-    result = test(scope=payload.scope or "all")
+    result = test.invoke({"scope": payload.scope or "all"})
     return _wrap_tool_result("test", result)
 
 
 @app.post("/tools/search", summary="工具调试：联网搜索", description="调用 search 工具，使用 SERPAPI 查询外部信息。")
 def debug_tool_search(payload: ToolSearchRequest = Body(...)):
     _ensure_debug_tools_enabled()
-    result = search(query=payload.query)
+    result = search.invoke({"query": payload.query})
     return _wrap_tool_result("search", result)
 
 
 @app.post("/tools/vector_search", summary="工具调试：向量检索", description="调用 vector_search 工具，从已入库文档中检索相似内容。")
 def debug_tool_vector_search(payload: ToolVectorSearchRequest = Body(...)):
     _ensure_debug_tools_enabled()
-    result = vector_search(query=payload.query)
+    result = vector_search.invoke({"query": payload.query})
     return _wrap_tool_result("vector_search", result)
 
 
 @app.post("/tools/xingpan", summary="工具调试：星盘", description="调用 xingpan 工具，依据姓名、出生时间、经纬度查询星盘。")
 def debug_tool_xingpan(payload: ToolXingpanRequest = Body(...)):
     _ensure_debug_tools_enabled()
-    result = xingpan(
-        name=payload.name,
-        birth_dt=payload.birth_dt,
-        longitude=payload.longitude,
-        latitude=payload.latitude,
+    result = xingpan.invoke(
+        {
+            "name": payload.name,
+            "birth_dt": payload.birth_dt,
+            "longitude": payload.longitude,
+            "latitude": payload.latitude,
+        }
     )
     return _wrap_tool_result("xingpan", result)
 
 
-@app.post("/tools/astro/my_sign", summary="工具调试：星座信息", description="调用 astro_my_sign 工具，读取 ASTRO_UID/UID 并查询星座信息。")
-def debug_tool_astro_my_sign():
+@app.post("/tools/astro/my_sign", summary="工具调试：星座信息", description="调用 astro_my_sign 工具，读取 ASTRO_UID 并查询星座信息。")
+def debug_tool_astro_my_sign(payload: ToolAstroChartRequest = Body(...)):
     _ensure_debug_tools_enabled()
-    result = astro_my_sign()
+    result = astro_my_sign.invoke(
+        {
+            "birth_dt": payload.birth_dt,
+            "longitude": payload.longitude,
+            "latitude": payload.latitude,
+        }
+    )
     return _wrap_tool_result("astro_my_sign", result)
+
+
+@app.post("/tools/astro/day", summary="工具调试：日运势", description="调用 astro_day_scope 工具，读取 ASTRO_UID 并查询日运势。")
+def debug_tool_astro_day():
+    _ensure_debug_tools_enabled()
+    result = astro_day_scope.invoke({})
+    return _wrap_tool_result("astro_day_scope", result)
+
+
+@app.post("/tools/astro/week", summary="工具调试：周运势", description="调用 astro_week_scope 工具，读取 ASTRO_UID 并查询周运势。")
+def debug_tool_astro_week():
+    _ensure_debug_tools_enabled()
+    result = astro_week_scope.invoke({})
+    return _wrap_tool_result("astro_week_scope", result)
+
+
+@app.post("/tools/astro/month", summary="工具调试：月运势", description="调用 astro_month_scope 工具，读取 ASTRO_UID 并查询月运势。")
+def debug_tool_astro_month():
+    _ensure_debug_tools_enabled()
+    result = astro_month_scope.invoke({})
+    return _wrap_tool_result("astro_month_scope", result)
 
 
 @app.post("/tools/astro/natal_chart", summary="工具调试：本命盘", description="调用 astro_natal_chart 工具，依据出生时间与经纬度查询本命盘。")
 def debug_tool_astro_natal(payload: ToolAstroChartRequest = Body(...)):
     _ensure_debug_tools_enabled()
-    result = astro_natal_chart(
-        birth_dt=payload.birth_dt,
-        longitude=payload.longitude,
-        latitude=payload.latitude,
+    result = astro_natal_chart.invoke(
+        {
+            "birth_dt": payload.birth_dt,
+            "longitude": payload.longitude,
+            "latitude": payload.latitude,
+        }
     )
     return _wrap_tool_result("astro_natal_chart", result)
 
@@ -782,17 +818,19 @@ def debug_tool_astro_natal(payload: ToolAstroChartRequest = Body(...)):
 @app.post("/tools/astro/current_chart", summary="工具调试：当前天象盘", description="调用 astro_current_chart 工具，查询当前天象盘。")
 def debug_tool_astro_current():
     _ensure_debug_tools_enabled()
-    result = astro_current_chart()
+    result = astro_current_chart.invoke({})
     return _wrap_tool_result("astro_current_chart", result)
 
 
 @app.post("/tools/astro/transit_chart", summary="工具调试：行运盘", description="调用 astro_transit_chart 工具，依据出生时间与经纬度查询行运盘。")
 def debug_tool_astro_transit(payload: ToolAstroChartRequest = Body(...)):
     _ensure_debug_tools_enabled()
-    result = astro_transit_chart(
-        birth_dt=payload.birth_dt,
-        longitude=payload.longitude,
-        latitude=payload.latitude,
+    result = astro_transit_chart.invoke(
+        {
+            "birth_dt": payload.birth_dt,
+            "longitude": payload.longitude,
+            "latitude": payload.latitude,
+        }
     )
     return _wrap_tool_result("astro_transit_chart", result)
 
@@ -917,6 +955,16 @@ def debug_ui():
             </div>
 
             <div class="card">
+                <h2>Chat</h2>
+                <label>query</label>
+                <textarea id="chat-query" placeholder="输入对话内容"></textarea>
+                <label>session_id</label>
+                <input id="chat-session" placeholder="session id" />
+                <button onclick="callToolQuery('/chat', {query: byId('chat-query').value, session_id: byId('chat-session').value}, {}, 'out-chat')">执行</button>
+                <pre id="out-chat"></pre>
+            </div>
+
+            <div class="card">
                 <h2>联网搜索</h2>
                 <label>query</label>
                 <input id="search-query" placeholder="输入搜索关键词" />
@@ -930,6 +978,41 @@ def debug_ui():
                 <input id="vector-query" placeholder="输入检索关键词" />
                 <button onclick="callTool('/tools/vector_search', {query: byId('vector-query').value}, 'out-vector')">执行</button>
                 <pre id="out-vector"></pre>
+            </div>
+
+            <div class="card">
+                <h2>add_urls / dry_run</h2>
+                <label>url</label>
+                <input id="add-url" placeholder="单个URL" />
+                <label>urls（每行一个）</label>
+                <textarea id="add-urls" placeholder="https://example.com\nhttps://example.org"></textarea>
+                <label>chunk_strategy</label>
+                <select id="add-strategy">
+                    <option value="balanced">balanced</option>
+                    <option value="faq">faq</option>
+                    <option value="article">article</option>
+                    <option value="custom">custom</option>
+                </select>
+                <div class="row">
+                    <div>
+                        <label>chunk_size</label>
+                        <input id="add-size" placeholder="可选" />
+                    </div>
+                    <div>
+                        <label>chunk_overlap</label>
+                        <input id="add-overlap" placeholder="可选" />
+                    </div>
+                    <div>
+                        <label>preview_limit</label>
+                        <input id="add-preview" placeholder="默认3" />
+                    </div>
+                    <div>
+                        <label>separators（每行一个）</label>
+                        <input id="add-seps" placeholder="仅custom建议填写" />
+                    </div>
+                </div>
+                <button onclick="callTool('/add_urls/dry_run', buildAddUrlsPayload(), 'out-add-dry')">执行</button>
+                <pre id="out-add-dry"></pre>
             </div>
 
             <div class="card">
@@ -960,6 +1043,24 @@ def debug_ui():
                 <h2>星座信息</h2>
                 <button onclick="callTool('/tools/astro/my_sign', {}, 'out-my-sign')">执行</button>
                 <pre id="out-my-sign"></pre>
+            </div>
+
+            <div class="card">
+                <h2>日运势</h2>
+                <button onclick="callTool('/tools/astro/day', {}, 'out-day-scope')">执行</button>
+                <pre id="out-day-scope"></pre>
+            </div>
+
+            <div class="card">
+                <h2>周运势</h2>
+                <button onclick="callTool('/tools/astro/week', {}, 'out-week-scope')">执行</button>
+                <pre id="out-week-scope"></pre>
+            </div>
+
+            <div class="card">
+                <h2>月运势</h2>
+                <button onclick="callTool('/tools/astro/month', {}, 'out-month-scope')">执行</button>
+                <pre id="out-month-scope"></pre>
             </div>
 
             <div class="card">
@@ -1010,9 +1111,21 @@ def debug_ui():
         </section>
         <script>
             function byId(id) { return document.getElementById(id); }
+            function linesToList(text) {
+                return (text || "")
+                    .split(/\r?\n/)
+                    .map(function (line) { return line.trim(); })
+                    .filter(Boolean);
+            }
             function numVal(id) {
                 var raw = byId(id).value;
                 var val = parseFloat(raw);
+                return isNaN(val) ? raw : val;
+            }
+            function numOrNull(id) {
+                var raw = (byId(id).value || "").trim();
+                if (!raw) return null;
+                var val = parseInt(raw, 10);
                 return isNaN(val) ? raw : val;
             }
             async function callTool(path, payload, outputId) {
@@ -1034,13 +1147,58 @@ def debug_ui():
                     out.textContent = String(err);
                 }
             }
+            async function callToolQuery(path, queryParams, payload, outputId) {
+                var out = byId(outputId);
+                out.textContent = "loading...";
+                try {
+                    var query = new URLSearchParams(queryParams || {}).toString();
+                    var url = query ? path + "?" + query : path;
+                    var res = await fetch(url, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload || {}),
+                    });
+                    var text = await res.text();
+                    try {
+                        out.textContent = JSON.stringify(JSON.parse(text), null, 2);
+                    } catch (e) {
+                        out.textContent = text;
+                    }
+                } catch (err) {
+                    out.textContent = String(err);
+                }
+            }
+            function buildAddUrlsPayload() {
+                var payload = {
+                    chunk_strategy: byId('add-strategy').value,
+                };
+                var url = (byId('add-url').value || "").trim();
+                if (url) payload.url = url;
+                var urls = linesToList(byId('add-urls').value);
+                if (urls.length) payload.urls = urls;
+                var chunkSize = numOrNull('add-size');
+                if (chunkSize !== null) payload.chunk_size = chunkSize;
+                var chunkOverlap = numOrNull('add-overlap');
+                if (chunkOverlap !== null) payload.chunk_overlap = chunkOverlap;
+                var previewLimit = numOrNull('add-preview');
+                if (previewLimit !== null) payload.preview_limit = previewLimit;
+                var separators = linesToList(byId('add-seps').value);
+                if (separators.length) payload.separators = separators;
+                return payload;
+            }
         </script>
     </body>
 </html>
 """
 
-@app.post("/add_urls", response_model=AddUrlsResponse)
+@app.post(
+    "/add_urls",
+    response_model=AddUrlsResponse,
+    summary="URL学习入库",
+    description="抓取URL内容、切块并写入向量库。支持 JSON 与 Query 参数。",
+)
 def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> AddUrlsResponse:
+    """抓取并切块后写入向量库。"""
     overall_start = time.perf_counter()
     clean_url_list = _normalize_urls(payload)
 
@@ -1214,7 +1372,12 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
     )
 
 
-@app.post("/add_urls/dry_run", response_model=AddUrlsDryRunResponse)
+@app.post(
+    "/add_urls/dry_run",
+    response_model=AddUrlsDryRunResponse,
+    summary="URL切块预览",
+    description="仅抓取与切块预览，不写入向量库。支持 JSON 与 Query 参数。",
+)
 def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> AddUrlsDryRunResponse:
     """仅抓取和切块预览，不写入Qdrant。"""
     overall_start = time.perf_counter()
@@ -1295,17 +1458,23 @@ def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload
         quality_report=quality_report,
     )
 
-@app.post("/add_pdfs")
+@app.post("/add_pdfs", summary="PDF入库占位", description="占位接口：未来支持PDF解析与入库。")
 def add_pdfs():
+    """占位接口：PDF解析与入库功能待扩展。"""
     logger.info("调用add_pdfs接口")
     return {"response": "PDFs added!"}
 
-@app.post("/add_texts")
+@app.post("/add_texts", summary="文本入库占位", description="占位接口：未来支持直接文本入库。")
 def add_texts():
+    """占位接口：纯文本入库功能待扩展。"""
     logger.info("调用add_texts接口")
     return {"response": "Texts added!"}
 
-@app.post("/qdrant/init")
+@app.post(
+    "/qdrant/init",
+    summary="Qdrant初始化",
+    description="初始化集合，必要时可先删除旧集合再重建。",
+)
 def init_qdrant(
     collection: Optional[str] = Query(default=None, description="可选：指定要初始化的collection，默认使用QDRANT_COLLECTION"),
     recreate: bool = Query(default=False, description="是否先删除旧集合再重建"),
@@ -1321,7 +1490,11 @@ def init_qdrant(
         return {"code": 500, "error": err}
 
 
-@app.post("/qdrant/recreate")
+@app.post(
+    "/qdrant/recreate",
+    summary="Qdrant重建",
+    description="删除并重建指定集合，默认使用 QDRANT_COLLECTION。",
+)
 def recreate_qdrant(
     collection: Optional[str] = Query(default=None, description="可选：指定要重建的collection，默认使用QDRANT_COLLECTION"),
 ):
@@ -1336,7 +1509,7 @@ def recreate_qdrant(
         logger.error("Qdrant重建失败 | err: %s", err, exc_info=True)
         return {"code": 500, "error": err}
 
-@app.get("/qdrant/health")
+@app.get("/qdrant/health", summary="Qdrant健康检查", description="检查Qdrant连通性与可用性。")
 def qdrant_health_check():
     """Qdrant连通性检查。"""
     try:
@@ -1348,7 +1521,7 @@ def qdrant_health_check():
         logger.error("Qdrant健康检查失败 | err: %s", err, exc_info=True)
         return {"code": 500, "error": err}
 
-@app.get("/qdrant/collections")
+@app.get("/qdrant/collections", summary="Qdrant集合列表", description="列出当前Qdrant中的集合。")
 def qdrant_collections():
     """列出Qdrant collections。"""
     try:
@@ -1361,7 +1534,7 @@ def qdrant_collections():
         return {"code": 500, "error": err}
 
 
-@app.get("/qdrant/status")
+@app.get("/qdrant/status", summary="Qdrant状态", description="获取Qdrant仓库的轻量状态信息。")
 def qdrant_status():
     """简单监视Qdrant仓库状态。"""
     try:
@@ -1373,7 +1546,7 @@ def qdrant_status():
         logger.error("Qdrant status失败 | err: %s", err, exc_info=True)
         return {"code": 500, "error": err}
 
-@app.get("/health")
+@app.get("/health", summary="服务健康检查", description="检查服务与LLM连通性，返回运行状态。")
 async def health_check():
     """健康检查接口"""
     try:
@@ -1397,7 +1570,7 @@ async def health_check():
             "error": str(e)[:100]
         }
 
-@app.get("/memory/status")
+@app.get("/memory/status", summary="会话记忆状态", description="按 session_id 查询会话记忆状态。")
 def memory_status(session_id: str):
     """查看指定session的memory状态。"""
     if not session_id.strip():
@@ -1413,7 +1586,7 @@ def memory_status(session_id: str):
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
-    """WebSocket接口"""
+    """WebSocket对话通道，使用 query 参数 session_id 进行会话隔离。"""
     await websocket.accept()
     client_ip = websocket.client.host
     session_id = (websocket.query_params.get("session_id") or "").strip()
