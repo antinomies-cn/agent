@@ -1,10 +1,12 @@
 import os
+import json
 import sys
 import time
 import logging
 import requests
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from langchain.text_splitter import RecursiveCharacterTextSplitter  
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.vectorstores import Qdrant
@@ -22,6 +24,16 @@ if __package__ in (None, ""):
 from app.core.config import IS_PROD
 from app.core.logger_setup import logger, log_event
 from app.services.master_service import Master
+from app.tools.mytools import (
+    astro_current_chart,
+    astro_my_sign,
+    astro_natal_chart,
+    astro_transit_chart,
+    search,
+    test,
+    vector_search,
+    xingpan,
+)
 from app.services.qdrant_service import (
     init_qdrant_collection,
     qdrant_health,
@@ -115,6 +127,56 @@ class AddUrlsDryRunResponse(BaseModel):
     chunk_config: ChunkConfigModel
     chunk_preview: List[ChunkPreviewItem]
     quality_report: Dict[str, Any]
+
+
+class ToolTestRequest(BaseModel):
+    scope: Optional[str] = Field(default="all", description="all|astro|vector|search")
+
+
+class ToolSearchRequest(BaseModel):
+    query: str = Field(description="搜索关键词")
+
+
+class ToolVectorSearchRequest(BaseModel):
+    query: str = Field(description="向量检索关键词")
+
+
+class ToolXingpanRequest(BaseModel):
+    name: str = Field(description="姓名")
+    birth_dt: str = Field(description="出生时间 YYYY-MM-DD HH:MM:SS")
+    longitude: float = Field(description="经度")
+    latitude: float = Field(description="纬度")
+
+
+class ToolAstroChartRequest(BaseModel):
+    birth_dt: str = Field(description="出生时间 YYYY-MM-DD HH:MM:SS")
+    longitude: float = Field(description="经度")
+    latitude: float = Field(description="纬度")
+
+
+def _ensure_debug_tools_enabled():
+    if IS_PROD:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _wrap_tool_result(tool_name: str, raw_result: Any) -> Dict[str, Any]:
+    parsed = None
+    if isinstance(raw_result, str):
+        try:
+            parsed = json.loads(raw_result)
+        except Exception:
+            parsed = None
+
+    if isinstance(parsed, dict) and {"ok", "code", "data", "error"}.issubset(parsed.keys()):
+        return {"tool": tool_name, **parsed}
+
+    return {
+        "tool": tool_name,
+        "ok": True,
+        "code": "OK",
+        "data": parsed if parsed is not None else raw_result,
+        "error": "",
+    }
 
 
 def _resolve_add_urls_payload(
@@ -317,7 +379,15 @@ def _compute_chunk_quality_report(chunks: List[Any], failed_urls: List[dict], mi
     if short_ratio > 0.15:
         suggestions.append("尝试提高 chunk_size 或降低 chunk_overlap")
     if bad_end_ratio > 0.3:
-        suggestions.append("调整 separators，使切分优先落在句号/问号/换行")
+        suggestions.append("断句偏多，调整 separators，使切分优先落在句号/问号/换行")
+    if 0.2 < bad_end_ratio <= 0.3:
+        suggestions.append(
+            f"bad_end_ratio={bad_end_ratio:.3f}；可将 chunk_size 上调 15%-25%，并把强分隔符(\\n\\n, \\n, 。, ！, ？)放在 separators 前部"
+        )
+    if min_len_val and min_len_val < 60 and short_ratio > 0.01:
+        suggestions.append(f"min_len={min_len_val}；建议过滤 <80 字碎片，或适度上调 chunk_size")
+    if avg_len and avg_len < 300:
+        suggestions.append(f"avg_len={avg_len}；可增加 chunk_size 或做正文抽取(去导航/页脚)")
     if failed_urls:
         suggestions.append("检查失败 URL 的可访问性与 SSL 配置")
     if score < 70 and not suggestions:
@@ -656,6 +726,318 @@ def chat(query: str, session_id: str):
         error_msg = str(e)[:100]
         logger.error(f"Chat API执行异常 | 查询: {query[:50]} | 错误: {error_msg}", exc_info=True)
         return {"code": 500, "session_id": session_id, "query": query, "response": f"错误：{error_msg}"}
+
+
+@app.post("/tools/test", summary="工具调试：系统自检", description="调用 test 工具，支持 scope=all|astro|vector|search 用于快速排查配置。")
+def debug_tool_test(payload: ToolTestRequest = Body(...)):
+    _ensure_debug_tools_enabled()
+    result = test(scope=payload.scope or "all")
+    return _wrap_tool_result("test", result)
+
+
+@app.post("/tools/search", summary="工具调试：联网搜索", description="调用 search 工具，使用 SERPAPI 查询外部信息。")
+def debug_tool_search(payload: ToolSearchRequest = Body(...)):
+    _ensure_debug_tools_enabled()
+    result = search(query=payload.query)
+    return _wrap_tool_result("search", result)
+
+
+@app.post("/tools/vector_search", summary="工具调试：向量检索", description="调用 vector_search 工具，从已入库文档中检索相似内容。")
+def debug_tool_vector_search(payload: ToolVectorSearchRequest = Body(...)):
+    _ensure_debug_tools_enabled()
+    result = vector_search(query=payload.query)
+    return _wrap_tool_result("vector_search", result)
+
+
+@app.post("/tools/xingpan", summary="工具调试：星盘", description="调用 xingpan 工具，依据姓名、出生时间、经纬度查询星盘。")
+def debug_tool_xingpan(payload: ToolXingpanRequest = Body(...)):
+    _ensure_debug_tools_enabled()
+    result = xingpan(
+        name=payload.name,
+        birth_dt=payload.birth_dt,
+        longitude=payload.longitude,
+        latitude=payload.latitude,
+    )
+    return _wrap_tool_result("xingpan", result)
+
+
+@app.post("/tools/astro/my_sign", summary="工具调试：星座信息", description="调用 astro_my_sign 工具，读取 ASTRO_UID/UID 并查询星座信息。")
+def debug_tool_astro_my_sign():
+    _ensure_debug_tools_enabled()
+    result = astro_my_sign()
+    return _wrap_tool_result("astro_my_sign", result)
+
+
+@app.post("/tools/astro/natal_chart", summary="工具调试：本命盘", description="调用 astro_natal_chart 工具，依据出生时间与经纬度查询本命盘。")
+def debug_tool_astro_natal(payload: ToolAstroChartRequest = Body(...)):
+    _ensure_debug_tools_enabled()
+    result = astro_natal_chart(
+        birth_dt=payload.birth_dt,
+        longitude=payload.longitude,
+        latitude=payload.latitude,
+    )
+    return _wrap_tool_result("astro_natal_chart", result)
+
+
+@app.post("/tools/astro/current_chart", summary="工具调试：当前天象盘", description="调用 astro_current_chart 工具，查询当前天象盘。")
+def debug_tool_astro_current():
+    _ensure_debug_tools_enabled()
+    result = astro_current_chart()
+    return _wrap_tool_result("astro_current_chart", result)
+
+
+@app.post("/tools/astro/transit_chart", summary="工具调试：行运盘", description="调用 astro_transit_chart 工具，依据出生时间与经纬度查询行运盘。")
+def debug_tool_astro_transit(payload: ToolAstroChartRequest = Body(...)):
+    _ensure_debug_tools_enabled()
+    result = astro_transit_chart(
+        birth_dt=payload.birth_dt,
+        longitude=payload.longitude,
+        latitude=payload.latitude,
+    )
+    return _wrap_tool_result("astro_transit_chart", result)
+
+
+@app.get("/debug/ui", response_class=HTMLResponse, summary="调试界面", description="简易工具调试界面，仅非生产可用。")
+def debug_ui():
+        _ensure_debug_tools_enabled()
+        return """<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>工具调试台</title>
+        <style>
+            :root {
+                --bg: #f4f1ea;
+                --ink: #1e1e1e;
+                --accent: #2f5d50;
+                --card: #ffffff;
+                --border: #e3ddcf;
+            }
+            body {
+                margin: 0;
+                font-family: "Georgia", "Times New Roman", serif;
+                background: radial-gradient(circle at top left, #f7efe0 0%, #f4f1ea 45%, #efe7d6 100%);
+                color: var(--ink);
+            }
+            header {
+                padding: 24px 32px 12px;
+            }
+            h1 {
+                margin: 0 0 6px;
+                font-size: 28px;
+                letter-spacing: 0.5px;
+            }
+            p.sub {
+                margin: 0;
+                color: #5a5348;
+            }
+            .grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 16px;
+                padding: 16px 32px 32px;
+            }
+            .card {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 16px;
+                box-shadow: 0 6px 16px rgba(40, 34, 26, 0.08);
+            }
+            .card h2 {
+                margin: 0 0 8px;
+                font-size: 18px;
+            }
+            label {
+                display: block;
+                font-size: 13px;
+                color: #5a5348;
+                margin-bottom: 6px;
+            }
+            input, textarea, select {
+                width: 100%;
+                padding: 8px 10px;
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                font-size: 14px;
+                background: #fcfbf8;
+                box-sizing: border-box;
+            }
+            textarea {
+                min-height: 90px;
+                resize: vertical;
+            }
+            button {
+                margin-top: 10px;
+                background: var(--accent);
+                color: #fff;
+                border: none;
+                border-radius: 10px;
+                padding: 8px 14px;
+                cursor: pointer;
+            }
+            pre {
+                background: #1b1a17;
+                color: #e8e5de;
+                padding: 10px;
+                border-radius: 10px;
+                overflow: auto;
+                max-height: 240px;
+                font-size: 12px;
+            }
+            .row {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 8px;
+            }
+            @media (max-width: 720px) {
+                header, .grid { padding: 16px; }
+                .row { grid-template-columns: 1fr; }
+            }
+        </style>
+    </head>
+    <body>
+        <header>
+            <h1>工具调试台</h1>
+            <p class="sub">仅用于本地/测试环境。返回结构统一为 {tool, ok, code, data, error}。</p>
+        </header>
+        <section class="grid">
+            <div class="card">
+                <h2>系统自检</h2>
+                <label>scope</label>
+                <select id="test-scope">
+                    <option value="all">all</option>
+                    <option value="astro">astro</option>
+                    <option value="vector">vector</option>
+                    <option value="search">search</option>
+                </select>
+                <button onclick="callTool('/tools/test', {scope: byId('test-scope').value}, 'out-test')">执行</button>
+                <pre id="out-test"></pre>
+            </div>
+
+            <div class="card">
+                <h2>联网搜索</h2>
+                <label>query</label>
+                <input id="search-query" placeholder="输入搜索关键词" />
+                <button onclick="callTool('/tools/search', {query: byId('search-query').value}, 'out-search')">执行</button>
+                <pre id="out-search"></pre>
+            </div>
+
+            <div class="card">
+                <h2>向量检索</h2>
+                <label>query</label>
+                <input id="vector-query" placeholder="输入检索关键词" />
+                <button onclick="callTool('/tools/vector_search', {query: byId('vector-query').value}, 'out-vector')">执行</button>
+                <pre id="out-vector"></pre>
+            </div>
+
+            <div class="card">
+                <h2>星盘</h2>
+                <div class="row">
+                    <div>
+                        <label>name</label>
+                        <input id="xingpan-name" placeholder="姓名" />
+                    </div>
+                    <div>
+                        <label>birth_dt</label>
+                        <input id="xingpan-birth" placeholder="1999-10-17 21:00:00" />
+                    </div>
+                    <div>
+                        <label>longitude</label>
+                        <input id="xingpan-lng" placeholder="120.1" />
+                    </div>
+                    <div>
+                        <label>latitude</label>
+                        <input id="xingpan-lat" placeholder="30.2" />
+                    </div>
+                </div>
+                <button onclick="callTool('/tools/xingpan', {name: byId('xingpan-name').value, birth_dt: byId('xingpan-birth').value, longitude: numVal('xingpan-lng'), latitude: numVal('xingpan-lat')}, 'out-xingpan')">执行</button>
+                <pre id="out-xingpan"></pre>
+            </div>
+
+            <div class="card">
+                <h2>星座信息</h2>
+                <button onclick="callTool('/tools/astro/my_sign', {}, 'out-my-sign')">执行</button>
+                <pre id="out-my-sign"></pre>
+            </div>
+
+            <div class="card">
+                <h2>本命盘</h2>
+                <div class="row">
+                    <div>
+                        <label>birth_dt</label>
+                        <input id="natal-birth" placeholder="1999-10-17 21:00:00" />
+                    </div>
+                    <div>
+                        <label>longitude</label>
+                        <input id="natal-lng" placeholder="120.1" />
+                    </div>
+                    <div>
+                        <label>latitude</label>
+                        <input id="natal-lat" placeholder="30.2" />
+                    </div>
+                </div>
+                <button onclick="callTool('/tools/astro/natal_chart', {birth_dt: byId('natal-birth').value, longitude: numVal('natal-lng'), latitude: numVal('natal-lat')}, 'out-natal')">执行</button>
+                <pre id="out-natal"></pre>
+            </div>
+
+            <div class="card">
+                <h2>当前天象盘</h2>
+                <button onclick="callTool('/tools/astro/current_chart', {}, 'out-current')">执行</button>
+                <pre id="out-current"></pre>
+            </div>
+
+            <div class="card">
+                <h2>行运盘</h2>
+                <div class="row">
+                    <div>
+                        <label>birth_dt</label>
+                        <input id="transit-birth" placeholder="1999-10-17 21:00:00" />
+                    </div>
+                    <div>
+                        <label>longitude</label>
+                        <input id="transit-lng" placeholder="120.1" />
+                    </div>
+                    <div>
+                        <label>latitude</label>
+                        <input id="transit-lat" placeholder="30.2" />
+                    </div>
+                </div>
+                <button onclick="callTool('/tools/astro/transit_chart', {birth_dt: byId('transit-birth').value, longitude: numVal('transit-lng'), latitude: numVal('transit-lat')}, 'out-transit')">执行</button>
+                <pre id="out-transit"></pre>
+            </div>
+        </section>
+        <script>
+            function byId(id) { return document.getElementById(id); }
+            function numVal(id) {
+                var raw = byId(id).value;
+                var val = parseFloat(raw);
+                return isNaN(val) ? raw : val;
+            }
+            async function callTool(path, payload, outputId) {
+                var out = byId(outputId);
+                out.textContent = "loading...";
+                try {
+                    var res = await fetch(path, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload || {}),
+                    });
+                    var text = await res.text();
+                    try {
+                        out.textContent = JSON.stringify(JSON.parse(text), null, 2);
+                    } catch (e) {
+                        out.textContent = text;
+                    }
+                } catch (err) {
+                    out.textContent = String(err);
+                }
+            }
+        </script>
+    </body>
+</html>
+"""
 
 @app.post("/add_urls", response_model=AddUrlsResponse)
 def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> AddUrlsResponse:

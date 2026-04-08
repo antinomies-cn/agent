@@ -49,6 +49,7 @@ services:
       - ./logs:/app/logs
       - ./qdrant_data:/app/qdrant_data
       - ./model_cache:/app/model_cache
+      - ./app:/app/app
 
   redis:
     image: redis:7-alpine
