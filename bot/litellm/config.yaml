@@ -2,9 +2,39 @@ model_list:
   - model_name: MiniMax-M2.5
     litellm_params:
       model: openai/MiniMax-M2.5
-      api_base: os.environ/UPSTREAM_OPENAI_API_BASE
-      api_key: os.environ/UPSTREAM_OPENAI_API_KEY
+      api_base: os.environ/MIN_API_BASE
+      api_key: os.environ/MIN_API_KEY
       timeout: 60
+
+  - model_name: DeepSeek-R1-0528
+    litellm_params:
+      model: openai/DeepSeek-R1-0528
+      api_base: os.environ/DEEP_API_BASE
+      api_key: os.environ/DEEP_API_KEY
+      timeout: 60
+
+  - model_name: GLM-5
+    litellm_params:
+      model: openai/GLM-5
+      api_base: os.environ/GLM_API_BASE
+      api_key: os.environ/GLM_API_KEY
+      timeout: 60  
+
+  - model_name: bge-m3
+    litellm_params:
+      model: openai/BAAI/bge-m3
+      model_type: embedding  # 标记向量模型
+      api_key: os.environ/BGE_API_KEY
+      api_base: os.environ/BGE_API_BASE
+      timeout: 60
+
+  - model_name: bge-reranker
+    litellm_params:
+      model: openai/bge-reranker-v2-m3
+      model_type: rerank  # 重排模型
+      api_key: os.environ/RERANK_API_KEY 
+      api_base: os.environ/RERANK_API_BASE  
+      timeout: 60  
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
