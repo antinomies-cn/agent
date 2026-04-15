@@ -1,4 +1,27 @@
 services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-v1.82.0-stable
+    pull_policy: if_not_present
+    container_name: litellm-proxy
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0", "--num_workers", "4"]
+    ports:
+      - "4001:4000"
+    environment:
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY}"
+      LITELLM_SALT_KEY: "${LITELLM_SALT_KEY}"
+      UPSTREAM_OPENAI_API_KEY: "${UPSTREAM_OPENAI_API_KEY}"
+      UPSTREAM_OPENAI_API_BASE: "${UPSTREAM_OPENAI_API_BASE:-https://api.edgefn.net}"
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "litellm", "--health", "--port", "4000", "--host", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s 
+    env_file: .env
+
   app:
     build:
       context: .
@@ -23,8 +46,8 @@ services:
       MEMORY_TTL: "86400"
       MEMORY_COMPACT_MESSAGE_COUNT: "10"
       MOOD_TIMEOUT_SECONDS: "5"
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
-      OPENAI_API_BASE: "${OPENAI_API_BASE}"
+      OPENAI_API_KEY: "${LITELLM_MASTER_KEY}"
+      OPENAI_API_BASE: "http://litellm:4000"
       OPENAI_MODEL: "${OPENAI_MODEL}"
       EMBEDDINGS_API: "${EMBEDDINGS_API:-openai}"
       EMBEDDINGS_MODEL: "${EMBEDDINGS_MODEL:-text-embedding-3-small}"
@@ -41,10 +64,12 @@ services:
       ASTRO_UID: "${ASTRO_UID:-}"
       WEB_LOADER_VERIFY_SSL: "${WEB_LOADER_VERIFY_SSL:-true}"
     depends_on:
+      litellm:
+        condition: service_healthy
       redis:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./logs:/app/logs
       - ./qdrant_data:/app/qdrant_data
@@ -59,12 +84,14 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-64588515}\" ping | grep PONG"]
+      test: ["CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD:-64588515}\" ping | grep -q PONG"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 10
+      start_period: 10s 
     volumes:
       - redis_data:/data
+    env_file: .env
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -76,6 +103,13 @@ services:
       - "6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
+    healthcheck:  
+      test: ["CMD-SHELL", "cat /proc/net/tcp /proc/net/tcp6 | grep -qi '00000000:18BD'"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 15s
+    env_file: .env
 
 volumes:
   redis_data:
