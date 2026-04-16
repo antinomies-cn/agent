@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import requests
 
 try:
     from dotenv import load_dotenv
@@ -36,20 +37,16 @@ def _is_true(value: str, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _resolve_local_model_path(model_name: str, cache_dir: str) -> str:
-    clean_model = (model_name or "").strip()
-    if not clean_model:
-        return clean_model
+def _warn(message: str) -> None:
+    logger.warning("startup-check warn: %s", message)
+    log_event(logging.WARNING, "startup_check.warn", message=message)
 
-    if os.path.isdir(clean_model):
-        return clean_model
 
-    if cache_dir and "/" in clean_model:
-        candidate = os.path.join(cache_dir, *clean_model.split("/"))
-        if os.path.isdir(candidate):
-            return candidate
-
-    return clean_model
+def _normalize_openai_base_url(raw_base_url: str) -> str:
+    base = (raw_base_url or "").strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base.rstrip("/")
 
 
 def _fail(message: str) -> int:
@@ -67,85 +64,178 @@ def main() -> int:
         log_event(logging.INFO, "startup_check.skip", reason="EMBEDDINGS_STARTUP_CHECK=false")
         return 0
 
-    provider = os.getenv("EMBEDDINGS_API", "openai").strip().lower()
-    if provider != "local":
-        logger.info("startup-check skip: EMBEDDINGS_API=%s", provider)
-        log_event(logging.INFO, "startup_check.skip", reason=f"EMBEDDINGS_API={provider}")
-        return 0
+    api_base = _normalize_openai_base_url(
+        os.getenv("OPENAI_EMBEDDINGS_API_BASE", "").strip() or os.getenv("OPENAI_API_BASE", "").strip()
+    )
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    embedding_model = os.getenv("EMBEDDINGS_MODEL", "bge-m3").strip() or "bge-m3"
 
-    model_name = os.getenv("EMBEDDINGS_MODEL", "").strip()
-    cache_dir = os.getenv("EMBEDDINGS_CACHE_DIR", "").strip()
-    local_files_only = _is_true(os.getenv("EMBEDDINGS_LOCAL_FILES_ONLY", "false"), default=False)
+    if not api_base:
+        return _fail("OPENAI_API_BASE 未配置")
+    if not api_key:
+        return _fail("OPENAI_API_KEY 未配置")
 
-    resolved_model = _resolve_local_model_path(model_name, cache_dir)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
-    if not resolved_model:
-        return _fail("EMBEDDINGS_MODEL 未配置")
-    if not os.path.isdir(resolved_model):
-        return _fail(
-            "本地模型目录不存在: "
-            f"{resolved_model} | model={model_name} | cache_dir={cache_dir}"
-        )
-
-    required_files = [
-        "config.json",
-        "modules.json",
-        "sentence_bert_config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "vocab.txt",
-        os.path.join("1_Pooling", "config.json"),
-        "model.safetensors",
-    ]
-    missing = [name for name in required_files if not os.path.isfile(os.path.join(resolved_model, name))]
-    if missing:
-        return _fail(f"模型目录缺少关键文件: {', '.join(missing)}")
-
-    try:
-        from sentence_transformers import SentenceTransformer
-    except Exception as e:
-        return _fail(f"sentence-transformers 不可用: {str(e)[:200]}")
-
-    if local_files_only:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
-    try:
-        model = SentenceTransformer(
-            resolved_model,
-            cache_folder=(cache_dir or None),
-            local_files_only=local_files_only,
-        )
-        embeddings = model.encode(["startup_check_probe"])
-        dim = len(embeddings[0])
-    except Exception as e:
-        return _fail(f"离线模型加载失败: {str(e)[:300]}")
-
+    expected_dim = None
     expected_dim_text = os.getenv("EMBEDDINGS_DIMENSION", "").strip()
     if expected_dim_text:
         try:
-            expected_dim = int(expected_dim_text)
-            if expected_dim > 0 and dim != expected_dim:
-                return _fail(
-                    f"向量维度不匹配: actual={dim}, EMBEDDINGS_DIMENSION={expected_dim}"
-                )
+            parsed = int(expected_dim_text)
+            if parsed > 0:
+                expected_dim = parsed
         except ValueError:
             logger.warning("startup-check warn: EMBEDDINGS_DIMENSION invalid: %s", expected_dim_text)
             log_event(logging.WARNING, "startup_check.warn", reason="EMBEDDINGS_DIMENSION invalid")
 
+    embed_body = {
+        "model": embedding_model,
+        "input": ["startup_check_probe"],
+    }
+    if expected_dim:
+        embed_body["dimensions"] = expected_dim
+
+    try:
+        resp = requests.post(
+            f"{api_base}/v1/embeddings",
+            headers=headers,
+            json=embed_body,
+            timeout=15,
+        )
+        if resp.status_code >= 400 and expected_dim is not None:
+            fallback_body = {
+                "model": embedding_model,
+                "input": ["startup_check_probe"],
+            }
+            fallback_resp = requests.post(
+                f"{api_base}/v1/embeddings",
+                headers=headers,
+                json=fallback_body,
+                timeout=15,
+            )
+            fallback_resp.raise_for_status()
+            payload = fallback_resp.json()
+        else:
+            resp.raise_for_status()
+            payload = resp.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list) or not data:
+            return _fail("LiteLLM embeddings 响应缺少 data")
+        first = data[0] if isinstance(data[0], dict) else {}
+        vector = first.get("embedding") if isinstance(first, dict) else None
+        if not isinstance(vector, list) or not vector:
+            return _fail("LiteLLM embeddings 响应缺少 embedding")
+        actual_dim = len(vector)
+    except Exception as e:
+        return _fail(f"LiteLLM embeddings 探测失败: {str(e)[:280]}")
+
+    if expected_dim and actual_dim != expected_dim:
+        return _fail(f"向量维度不匹配: actual={actual_dim}, EMBEDDINGS_DIMENSION={expected_dim}")
+
+    rerank_enabled = _is_true(os.getenv("RERANK_ENABLED", "true"), default=True)
+    rerank_model = os.getenv("RERANK_MODEL", "bge-reranker").strip() or "bge-reranker"
+    rerank_ok = True
+    rerank_note = "skipped"
+
+    if rerank_enabled:
+        rerank_strict = _is_true(os.getenv("RERANK_STARTUP_STRICT", "false"), default=False)
+        direct_upstream = _is_true(os.getenv("RERANK_DIRECT_UPSTREAM", "true"), default=True)
+        rerank_base = _normalize_openai_base_url(os.getenv("RERANK_API_BASE", "").strip()) if direct_upstream else api_base
+        rerank_api_key = os.getenv("RERANK_API_KEY", "").strip() if direct_upstream else api_key
+        rerank_body = {
+            "model": (os.getenv("RERANK_UPSTREAM_MODEL", "").strip() or ("bge-reranker-v2-m3" if rerank_model == "bge-reranker" else rerank_model)),
+            "query": "startup_check_probe",
+            "documents": ["alpha", "beta"],
+            "top_n": 1,
+        }
+
+        if not rerank_base or not rerank_api_key:
+            message = "RERANK_API_BASE 或 RERANK_API_KEY 未配置，跳过 rerank 探测"
+            if rerank_strict:
+                return _fail(message)
+            _warn(message)
+            rerank_ok = False
+            rerank_note = "skipped_missing_config"
+            logger.info(
+                "startup-check ok: provider=litellm embedding_model=%s dim=%s rerank_enabled=%s rerank_model=%s rerank_endpoint=%s",
+                embedding_model,
+                actual_dim,
+                rerank_enabled,
+                rerank_model,
+                rerank_note,
+            )
+            log_event(
+                logging.INFO,
+                "startup_check.ok",
+                provider="litellm",
+                embedding_model=embedding_model,
+                dim=actual_dim,
+                rerank_enabled=rerank_enabled,
+                rerank_ok=rerank_ok,
+                rerank_model=rerank_model,
+                rerank_endpoint=rerank_note,
+            )
+            return 0
+
+        rerank_headers = {
+            "Authorization": f"Bearer {rerank_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_error = None
+        endpoints = ("/rerank", "/v1/rerank") if direct_upstream else ("/v1/rerank", "/rerank")
+        for endpoint in endpoints:
+            try:
+                rerank_resp = requests.post(
+                    f"{rerank_base}{endpoint}",
+                    headers=rerank_headers,
+                    json=rerank_body,
+                    timeout=15,
+                )
+                if rerank_resp.status_code == 404:
+                    continue
+                rerank_resp.raise_for_status()
+                rerank_payload = rerank_resp.json()
+                results = rerank_payload.get("results") if isinstance(rerank_payload, dict) else None
+                if not isinstance(results, list):
+                    results = rerank_payload.get("data") if isinstance(rerank_payload, dict) else None
+                if not isinstance(results, list) or not results:
+                    raise RuntimeError("rerank response missing results")
+                rerank_note = endpoint
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+
+        if last_error is not None:
+            rerank_ok = False
+            message = f"LiteLLM rerank 探测失败: {str(last_error)[:280]}"
+            if rerank_strict:
+                return _fail(message)
+            _warn(message)
+            rerank_note = "failed_non_fatal"
+
     logger.info(
-        "startup-check ok: provider=local model=%s local_files_only=%s dim=%s",
-        resolved_model,
-        local_files_only,
-        dim,
+        "startup-check ok: provider=litellm embedding_model=%s dim=%s rerank_enabled=%s rerank_model=%s rerank_endpoint=%s",
+        embedding_model,
+        actual_dim,
+        rerank_enabled,
+        rerank_model,
+        rerank_note,
     )
     log_event(
         logging.INFO,
         "startup_check.ok",
-        provider="local",
-        model=resolved_model,
-        local_files_only=local_files_only,
-        dim=dim,
+        provider="litellm",
+        embedding_model=embedding_model,
+        dim=actual_dim,
+        rerank_enabled=rerank_enabled,
+        rerank_ok=rerank_ok,
+        rerank_model=rerank_model,
+        rerank_endpoint=rerank_note,
     )
     return 0
 

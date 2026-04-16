@@ -3,14 +3,17 @@ import json
 import sys
 import time
 import logging
+import socket
+import ipaddress
+from enum import Enum
 import requests
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 from langchain.text_splitter import RecursiveCharacterTextSplitter  
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.vectorstores import Qdrant
-from langchain_openai import OpenAIEmbeddings
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
@@ -22,7 +25,9 @@ if __package__ in (None, ""):
         sys.path.insert(0, project_root)
 
 from app.core.config import IS_PROD
+from app.core.embedding_config import resolve_embedding_config
 from app.core.logger_setup import logger, log_event
+from app.core.litellm_adapters import build_litellm_embeddings_client
 from app.services.master_service import Master
 from app.tools.mytools import (
     astro_current_chart,
@@ -46,8 +51,38 @@ from app.services.qdrant_service import (
 )
 from app.core.texts import USER_MESSAGES
 
-app = FastAPI()
+app = FastAPI(
+    docs_url=None if IS_PROD else "/docs",
+    redoc_url=None if IS_PROD else "/redoc",
+    openapi_url=None if IS_PROD else "/openapi.json",
+)
 master = Master()
+
+_PROD_ALLOWED_HTTP_PATHS = {"/chat"}
+
+
+def _is_prod_runtime() -> bool:
+    return os.getenv("ENV", "dev").strip().lower() == "prod"
+
+
+@app.middleware("http")
+async def _restrict_routes_in_prod(request: Request, call_next):
+    if _is_prod_runtime() and request.url.path not in _PROD_ALLOWED_HTTP_PATHS:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
+
+
+class AddUrlsErrorCode(str, Enum):
+    FETCH_ERROR = "FETCH_ERROR"
+    BLOCKED_URL = "BLOCKED_URL"
+    INVALID_URL = "INVALID_URL"
+    UNSUPPORTED_SCHEME = "UNSUPPORTED_SCHEME"
+    MISSING_HOST = "MISSING_HOST"
+    INVALID_IP = "INVALID_IP"
+    BLOCKED_PRIVATE_IP = "BLOCKED_PRIVATE_IP"
+    BLOCKED_LOOPBACK = "BLOCKED_LOOPBACK"
+    BLOCKED_LINK_LOCAL = "BLOCKED_LINK_LOCAL"
+    BLOCKED_INTERNAL_HOST = "BLOCKED_INTERNAL_HOST"
 
 
 class AddUrlsRequest(BaseModel):
@@ -75,6 +110,7 @@ class FailedUrlItem(BaseModel):
     """单个失败URL信息。error 仅截取前120字符，避免日志/响应过长。"""
 
     url: str = Field(description="失败URL")
+    code: AddUrlsErrorCode = Field(default=AddUrlsErrorCode.FETCH_ERROR, description="失败类型编码")
     error: str = Field(description="失败原因")
 
 
@@ -130,6 +166,31 @@ class AddUrlsDryRunResponse(BaseModel):
     chunk_config: ChunkConfigModel
     chunk_preview: List[ChunkPreviewItem]
     quality_report: Dict[str, Any]
+
+
+class EmbeddingConfigResponse(BaseModel):
+    """当前生效的 Embedding 配置，便于线上排障。"""
+
+    model: str = Field(description="当前生效的 embedding 模型别名")
+    dimensions: int = Field(description="当前生效的向量维度")
+    dimension_source: Literal["env", "model_hint", "fallback", "default"] = Field(
+        description="维度来源：env|model_hint|fallback|default"
+    )
+    collection: str = Field(description="当前 Qdrant 目标集合")
+    qdrant_distance: str = Field(description="当前 Qdrant 距离度量")
+
+
+class RerankConfigResponse(BaseModel):
+    """当前生效的 rerank 配置，便于线上排障。"""
+
+    enabled: bool = Field(description="rerank 是否启用")
+    direct_upstream: bool = Field(description="是否直连上游 rerank，而不是走 LiteLLM")
+    model: str = Field(description="当前 rerank 路由模型别名")
+    upstream_model: str = Field(description="当前直连上游使用的模型名")
+    upstream_base: str = Field(description="当前直连上游的基础地址")
+    timeout_seconds: float = Field(description="rerank 超时秒数")
+    top_n: Optional[int] = Field(default=None, description="rerank 返回的最大结果数，未设置则为 null")
+    startup_strict: bool = Field(description="rerank 启动探针是否严格失败")
 
 
 class ToolTestRequest(BaseModel):
@@ -294,6 +355,102 @@ def _normalize_urls(payload: AddUrlsRequest) -> List[str]:
     return clean_url_list
 
 
+def _is_truthy_env(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_public_http_url(raw_url: str) -> tuple[bool, Optional[AddUrlsErrorCode], str]:
+    """阻断私网/环回/链路本地地址，降低 SSRF 风险。"""
+    try:
+        parsed = urlparse(raw_url)
+    except Exception:
+        return False, AddUrlsErrorCode.INVALID_URL, "URL解析失败"
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return False, AddUrlsErrorCode.UNSUPPORTED_SCHEME, "仅支持 http/https URL"
+
+    hostname = (parsed.hostname or "").strip()
+    if not hostname:
+        return False, AddUrlsErrorCode.MISSING_HOST, "URL缺少主机名"
+
+    normalized_host = hostname.lower().rstrip(".")
+    if normalized_host in {"localhost", "localhost.localdomain"}:
+        return False, AddUrlsErrorCode.BLOCKED_LOOPBACK, "禁止访问环回地址"
+
+    ip_candidates = []
+    host_is_ip_literal = False
+    try:
+        ip_candidates.append(ipaddress.ip_address(hostname))
+        host_is_ip_literal = True
+    except ValueError:
+        if "." not in normalized_host:
+            return False, AddUrlsErrorCode.BLOCKED_INTERNAL_HOST, "禁止访问疑似内网主机名"
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+            for info in infos:
+                sockaddr = info[4]
+                if not sockaddr:
+                    continue
+                candidate_ip = sockaddr[0]
+                try:
+                    ip_candidates.append(ipaddress.ip_address(candidate_ip))
+                except ValueError:
+                    continue
+        except socket.gaierror:
+            # DNS 暂不可用时，不把公网域名误判为私网；后续抓取流程再决定是否可访问。
+            return True, None, ""
+        except Exception:
+            return True, None, ""
+
+    if not ip_candidates and host_is_ip_literal:
+        return False, AddUrlsErrorCode.INVALID_IP, "IP地址无效"
+
+    for ip_obj in ip_candidates:
+        if ip_obj.is_loopback:
+            return False, AddUrlsErrorCode.BLOCKED_LOOPBACK, "禁止访问环回地址"
+        if ip_obj.is_link_local:
+            return False, AddUrlsErrorCode.BLOCKED_LINK_LOCAL, "禁止访问链路本地地址"
+        if ip_obj.is_private:
+            return False, AddUrlsErrorCode.BLOCKED_PRIVATE_IP, "禁止访问私网地址"
+
+    return True, None, ""
+
+
+def _partition_safe_urls(clean_url_list: List[str]) -> tuple[List[str], List[Dict[str, str]]]:
+    """把URL分为可访问与阻断列表。"""
+    allowed_urls: List[str] = []
+    blocked_urls: List[Dict[str, str]] = []
+    for one_url in clean_url_list:
+        ok, code, reason = _is_public_http_url(one_url)
+        if ok:
+            allowed_urls.append(one_url)
+        else:
+            blocked_urls.append(
+                {
+                    "url": one_url,
+                    "code": (code or AddUrlsErrorCode.BLOCKED_URL).value,
+                    "error": reason[:120],
+                }
+            )
+    return allowed_urls, blocked_urls
+
+
+def _ensure_add_urls_write_enabled() -> None:
+    """生产环境默认关闭入库，需显式开关开启。"""
+    env_name = os.getenv("ENV", "dev").strip().lower()
+    is_prod_runtime = env_name == "prod"
+    write_enabled = _is_truthy_env(os.getenv("ADD_URLS_WRITE_ENABLED", "false"))
+    if is_prod_runtime and not write_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "生产环境默认禁用 /add_urls 入库，请显式开启开关",
+                "required_env": "ADD_URLS_WRITE_ENABLED=true",
+            },
+        )
+
+
 def _collect_chunks_from_urls(clean_url_list: List[str], chunk_cfg: Dict[str, Any], strategy: str):
     """按URL抓取并切块，返回成功chunk与失败URL详情。"""
     all_chunks = []
@@ -308,7 +465,7 @@ def _collect_chunks_from_urls(clean_url_list: List[str], chunk_cfg: Dict[str, An
             documents = web_loader.load()
             all_chunks.extend(_chunk_documents(documents, one_url, chunk_cfg, strategy))
         except Exception as e:
-            failed_urls.append({"url": one_url, "error": str(e)[:400]})
+            failed_urls.append({"url": one_url, "code": AddUrlsErrorCode.FETCH_ERROR.value, "error": str(e)[:400]})
     return all_chunks, failed_urls
 
 
@@ -412,34 +569,6 @@ def _compute_chunk_quality_report(chunks: List[Any], failed_urls: List[dict], mi
         "signals": signals,
         "suggestions": suggestions,
     }
-
-
-def _resolve_embeddings_dimension(default_value: int) -> int:
-    raw = os.getenv("EMBEDDINGS_DIMENSION", "").strip()
-    if not raw:
-        return default_value
-    try:
-        value = int(raw)
-        if value > 0:
-            return value
-    except ValueError:
-        pass
-    logger.warning("EMBEDDINGS_DIMENSION 非法，已回退默认值: %s", default_value)
-    return default_value
-
-
-def _resolve_target_vector_size(default_value: int) -> int:
-    """仅读取EMBEDDINGS_DIMENSION作为向量维度来源。"""
-    raw = os.getenv("EMBEDDINGS_DIMENSION", "").strip()
-    if raw:
-        try:
-            value = int(raw)
-            if value > 0:
-                return value
-        except ValueError:
-            logger.warning("EMBEDDINGS_DIMENSION 非法，已回退默认值: %s", default_value)
-
-    return default_value
 
 
 def _resolve_embedding_output_dim(embeddings_client: Any, default_size: int) -> int:
@@ -619,96 +748,10 @@ def _ensure_qdrant_collection(client: QdrantClient, collection_name: str, vector
     return vector_size
 
 
-def _normalize_openai_base_url(raw_base_url: str) -> str:
-    """规范化 OPENAI_API_BASE，确保配置不包含 /v1。"""
-    base = (raw_base_url or "").strip().rstrip("/")
-    if base.endswith("/v1"):
-        base = base[:-3]
-    return base.rstrip("/")
-
-
-def _resolve_local_embedding_model(model_name: str, cache_dir: str) -> str:
-    """本地Embedding模型路径解析。
-
-    兼容两种输入：
-    - 直接传本地目录（推荐）
-    - 传仓库名（如 BAAI/bge-small-zh-v1.5），若 cache_dir 下存在同名目录则自动映射
-    """
-    clean_model = (model_name or "").strip()
-    if not clean_model:
-        return clean_model
-
-    if os.path.isdir(clean_model):
-        return clean_model
-
-    if cache_dir and "/" in clean_model:
-        candidate = os.path.join(cache_dir, *clean_model.split("/"))
-        if os.path.isdir(candidate):
-            return candidate
-
-    return clean_model
-
-
 def _build_embeddings_client(vector_size: int):
-    """按 EMBEDDINGS_API 构造 Embeddings 客户端。"""
-    provider = os.getenv("EMBEDDINGS_API", "openai").strip().lower()
-    embedding_model = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-small").strip() or "text-embedding-3-small"
-
-    if provider == "local":
-        try:
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-        except Exception as e:
-            raise RuntimeError("EMBEDDINGS_API=local 需要安装 sentence-transformers") from e
-        hf_endpoint = os.getenv("EMBEDDINGS_HF_ENDPOINT", "").strip()
-        local_files_only = os.getenv("EMBEDDINGS_LOCAL_FILES_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
-        cache_dir = os.getenv("EMBEDDINGS_CACHE_DIR", "").strip()
-        resolved_model = _resolve_local_embedding_model(embedding_model, cache_dir)
-
-        # 仅在 Embedding 初始化路径下设置 HF 运行时环境，避免影响其他模块。
-        if hf_endpoint and not local_files_only:
-            os.environ["HF_ENDPOINT"] = hf_endpoint.rstrip("/")
-        if local_files_only:
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-        if cache_dir:
-            os.environ["SENTENCE_TRANSFORMERS_HOME"] = cache_dir
-
-        model_kwargs: Dict[str, Any] = {"local_files_only": local_files_only}
-
-        try:
-            return HuggingFaceEmbeddings(
-                model_name=resolved_model,
-                cache_folder=(cache_dir or None),
-                model_kwargs=model_kwargs,
-                encode_kwargs={"normalize_embeddings": True},
-            )
-        except Exception as e:
-            expected_path = os.path.join(cache_dir, "BAAI", "bge-small-zh-v1.5") if cache_dir else ""
-            hint = (
-                "本地模型不可用。请先预下载模型到缓存目录，"
-                "或设置 EMBEDDINGS_HF_ENDPOINT 到可访问镜像站，"
-                "或将 EMBEDDINGS_API 切回 openai。"
-            )
-            raise RuntimeError(
-                f"初始化本地Embedding失败: {str(e)[:240]} | model={resolved_model} | expected_dir={expected_path} | {hint}"
-            ) from e
-
-    api_base = _normalize_openai_base_url(os.getenv("OPENAI_API_BASE", ""))
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    embedding_kwargs: Dict[str, Any] = {
-        "model": embedding_model,
-        "dimensions": _resolve_embeddings_dimension(vector_size),
-        # 某些代理模型不在 tiktoken 映射表中，固定编码可避免无意义告警。
-        "tiktoken_model_name": "cl100k_base",
-    }
-
-    if api_base:
-        embedding_kwargs["openai_api_base"] = f"{api_base}/v1"
-
-    if api_key:
-        embedding_kwargs["openai_api_key"] = api_key
-
-    return OpenAIEmbeddings(**embedding_kwargs)
+    """统一走 LiteLLM embeddings 模型（默认 bge-m3）。"""
+    embedding_cfg = resolve_embedding_config(default_dimension=vector_size)
+    return build_litellm_embeddings_client(default_dimensions=embedding_cfg.dimensions)
 
 @app.get("/", summary="根路径", description="基础连通性检查，返回简单响应。")
 def read_root():
@@ -1199,11 +1242,23 @@ def debug_ui():
 )
 def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> AddUrlsResponse:
     """抓取并切块后写入向量库。"""
+    _ensure_add_urls_write_enabled()
+
     overall_start = time.perf_counter()
     clean_url_list = _normalize_urls(payload)
 
     if not clean_url_list:
         raise HTTPException(status_code=400, detail="请提供url或urls参数")
+
+    clean_url_list, blocked_urls = _partition_safe_urls(clean_url_list)
+    if not clean_url_list:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "URL全部被安全策略拦截",
+                "failed_urls": blocked_urls,
+            },
+        )
 
     log_event(
         logging.INFO,
@@ -1221,6 +1276,7 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
 
     collect_start = time.perf_counter()
     all_chunks, failed_urls = _collect_chunks_from_urls(clean_url_list, chunk_cfg, payload.chunk_strategy)
+    failed_urls = [*blocked_urls, *failed_urls]
     quality_report = _compute_chunk_quality_report(all_chunks, failed_urls)
     collect_ms = int((time.perf_counter() - collect_start) * 1000)
     log_event(
@@ -1245,7 +1301,8 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
     qdrant_api_key = os.getenv("QDRANT_API_KEY", "").strip() or None
     qdrant_path = os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db")
     collection_name = os.getenv("QDRANT_COLLECTION", "divination_master_collection")
-    vector_size = _resolve_target_vector_size(default_value=384)
+    embedding_cfg = resolve_embedding_config()
+    vector_size = embedding_cfg.dimensions
 
     if qdrant_url:
         client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
@@ -1262,8 +1319,10 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
         log_event(
             logging.INFO,
             "add_urls.embeddings.init",
-            provider=os.getenv("EMBEDDINGS_API", "openai").strip().lower(),
+            provider="litellm",
+            model=getattr(embeddings_client, "model", ""),
             vector_size=effective_vector_size,
+            vector_size_source=embedding_cfg.dimension_source,
             elapsed_ms=int((time.perf_counter() - embeddings_start) * 1000),
         )
 
@@ -1385,6 +1444,16 @@ def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload
     if not clean_url_list:
         raise HTTPException(status_code=400, detail="请提供url或urls参数")
 
+    clean_url_list, blocked_urls = _partition_safe_urls(clean_url_list)
+    if not clean_url_list:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "URL全部被安全策略拦截",
+                "failed_urls": blocked_urls,
+            },
+        )
+
     chunk_cfg = _build_chunking_config(
         strategy=payload.chunk_strategy,
         chunk_size=payload.chunk_size,
@@ -1393,6 +1462,7 @@ def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload
     )
     collect_start = time.perf_counter()
     all_chunks, failed_urls = _collect_chunks_from_urls(clean_url_list, chunk_cfg, payload.chunk_strategy)
+    failed_urls = [*blocked_urls, *failed_urls]
     quality_report = _compute_chunk_quality_report(all_chunks, failed_urls)
     log_event(
         logging.INFO,
@@ -1546,6 +1616,73 @@ def qdrant_status():
         logger.error("Qdrant status失败 | err: %s", err, exc_info=True)
         return {"code": 500, "error": err}
 
+
+@app.get(
+    "/embedding/config",
+    response_model=EmbeddingConfigResponse,
+    summary="Embedding配置",
+    description="返回当前生效的 embedding 模型、维度与维度来源。",
+)
+def embedding_config() -> EmbeddingConfigResponse:
+    """读取当前生效 embedding 配置，用于排查维度不一致问题。"""
+    cfg = resolve_embedding_config()
+    return EmbeddingConfigResponse(
+        model=cfg.model,
+        dimensions=cfg.dimensions,
+        dimension_source=cfg.dimension_source,
+        collection=(os.getenv("QDRANT_COLLECTION", "divination_master_collection").strip() or "divination_master_collection"),
+        qdrant_distance=(os.getenv("QDRANT_DISTANCE", "cosine").strip().lower() or "cosine"),
+    )
+
+
+@app.get(
+    "/rerank/config",
+    response_model=RerankConfigResponse,
+    summary="Rerank配置",
+    description="返回当前 rerank 是否直连上游、路由模型与基础地址。",
+)
+def rerank_config() -> RerankConfigResponse:
+    """读取当前生效 rerank 配置，用于排查 rerank 路由与直连状态。"""
+    enabled = os.getenv("RERANK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    direct_upstream = os.getenv("RERANK_DIRECT_UPSTREAM", "true").strip().lower() in {"1", "true", "yes", "on"}
+    model = os.getenv("RERANK_MODEL", "bge-reranker").strip() or "bge-reranker"
+    upstream_model = os.getenv("RERANK_UPSTREAM_MODEL", "").strip()
+    if not upstream_model:
+        upstream_model = "bge-reranker-v2-m3" if model == "bge-reranker" else model
+
+    upstream_base = os.getenv("RERANK_API_BASE", "").strip() if direct_upstream else os.getenv("OPENAI_API_BASE", "").strip()
+    if upstream_base.endswith("/"):
+        upstream_base = upstream_base.rstrip("/")
+
+    top_n_raw = os.getenv("RERANK_TOP_N", "").strip()
+    top_n = None
+    if top_n_raw:
+        try:
+            top_n = int(top_n_raw)
+        except ValueError:
+            top_n = None
+
+    timeout_seconds = 15.0
+    raw_timeout = os.getenv("RERANK_TIMEOUT", "15").strip()
+    if raw_timeout:
+        try:
+            timeout_seconds = float(raw_timeout)
+        except ValueError:
+            timeout_seconds = 15.0
+
+    startup_strict = os.getenv("RERANK_STARTUP_STRICT", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+    return RerankConfigResponse(
+        enabled=enabled,
+        direct_upstream=direct_upstream,
+        model=model,
+        upstream_model=upstream_model,
+        upstream_base=upstream_base,
+        timeout_seconds=timeout_seconds,
+        top_n=top_n,
+        startup_strict=startup_strict,
+    )
+
 @app.get("/health", summary="服务健康检查", description="检查服务与LLM连通性，返回运行状态。")
 async def health_check():
     """健康检查接口"""
@@ -1570,6 +1707,16 @@ async def health_check():
             "error": str(e)[:100]
         }
 
+
+@app.get("/health/live", summary="服务存活检查", description="轻量存活检查，不依赖LLM。")
+def health_live():
+    """用于容器探针的轻量健康接口，避免外部依赖导致误判。"""
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "env": "production" if IS_PROD else "development",
+    }
+
 @app.get("/memory/status", summary="会话记忆状态", description="按 session_id 查询会话记忆状态。")
 def memory_status(session_id: str):
     """查看指定session的memory状态。"""
@@ -1587,6 +1734,10 @@ def memory_status(session_id: str):
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     """WebSocket对话通道，使用 query 参数 session_id 进行会话隔离。"""
+    if _is_prod_runtime():
+        await websocket.close(code=1008, reason="Not Found")
+        return
+
     await websocket.accept()
     client_ip = websocket.client.host
     session_id = (websocket.query_params.get("session_id") or "").strip()

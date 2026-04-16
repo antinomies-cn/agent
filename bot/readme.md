@@ -76,6 +76,8 @@
 | /qdrant/collections | GET | 列出集合 |
 | /qdrant/status | GET | Qdrant 仓库状态（轻量监视） |
 
+说明：当 ENV=prod 时，仅暴露 /chat；其余 HTTP/WebSocket 接口返回 Not Found。
+
 ### add_urls 输入示例（支持 Query 与 JSON）
 
 1. JSON 方式（推荐）
@@ -200,11 +202,11 @@ POST /add_urls/dry_run?url=https://example.com/a&chunk_strategy=faq&preview_limi
 
 ### Embeddings
 
-1. EMBEDDINGS_API：openai 或 local。
-2. EMBEDDINGS_MODEL：模型名或本地路径。
-3. EMBEDDINGS_DIMENSION：向量维度（正整数）。
-4. OPENAI Embeddings 会自动基于 OPENAI_API_BASE 拼接 /v1。
-5. local 模式支持离线加载与缓存目录。
+1. EMBEDDINGS_MODEL：LiteLLM 中配置的 embedding 模型别名，默认 bge-m3。
+2. EMBEDDINGS_DIMENSION：向量维度（正整数，可选）。
+3. OPENAI_EMBEDDINGS_API_BASE：可选，embedding 专用网关地址；未配置时回退 OPENAI_API_BASE。
+4. RERANK_ENABLED：是否启用检索后重排，默认 true。
+5. RERANK_MODEL：LiteLLM 中配置的 rerank 模型别名，默认 bge-reranker。
 
 ### Qdrant（已统一单集合）
 
@@ -224,7 +226,10 @@ POST /add_urls/dry_run?url=https://example.com/a&chunk_strategy=faq&preview_limi
 ### 抓取与启动检查
 
 1. WEB_LOADER_VERIFY_SSL：是否启用网页抓取 SSL 校验。
-2. EMBEDDINGS_STARTUP_CHECK：local embedding 启动前自检开关。
+2. EMBEDDINGS_STARTUP_CHECK：LiteLLM embedding/rerank 启动前自检开关。
+3. ADD_URLS_WRITE_ENABLED：生产环境是否允许 /add_urls 入库，默认 false（需显式设为 true 才可写库）。
+4. /add_urls 与 /add_urls/dry_run 会阻断私网/环回/链路本地地址，以及疑似内网主机名（如 redis）。
+5. 被拦截 URL 会返回机读 code（如 BLOCKED_PRIVATE_IP、BLOCKED_LOOPBACK、BLOCKED_LINK_LOCAL、BLOCKED_INTERNAL_HOST）。
 
 ### 占星接口本地连通性（Windows curl）
 
@@ -272,8 +277,8 @@ curl.exe -sS -X POST "https://cloud.apiworks.com/open/astro/mySign/$env:ASTRO_UI
 #### _build_embeddings_client
 
 1. 目的：创建 Embeddings 客户端。
-2. 实现：支持 openai 与 local，统一 OPENAI_API_BASE 归一化。
-3. 依赖：OpenAIEmbeddings，HuggingFaceEmbeddings。
+2. 实现：统一通过 LiteLLM `/v1/embeddings` 调用 bge-m3。
+3. 依赖：LiteLLMEmbeddings 适配层。
 
 #### _ensure_qdrant_collection
 
@@ -398,7 +403,7 @@ flowchart TD
     T --> S3["Astro APIs"]
 
     C3 --> W["Web Loader + Splitter"]
-    W --> E["Embeddings<br>openai or local"]
+    W --> E["Embeddings<br>LiteLLM bge-m3"]
     E --> Q[("Qdrant<br>QDRANT_COLLECTION")]
 
     S2 --> Q
@@ -418,16 +423,16 @@ flowchart TD
 3. OPENAI_MODEL：模型名。
 4. QDRANT_COLLECTION：唯一集合名（学习与检索共用）。
 5. QDRANT_URL（远程模式）或 QDRANT_DB_PATH（本地模式）。
-6. EMBEDDINGS_API：openai 或 local。
-7. EMBEDDINGS_MODEL：Embedding 模型名或本地目录。
-8. EMBEDDINGS_DIMENSION：Embedding 维度。
+6. EMBEDDINGS_MODEL：LiteLLM embedding 模型别名（默认 bge-m3）。
+7. EMBEDDINGS_DIMENSION：Embedding 维度。
+8. RERANK_ENABLED/RERANK_MODEL：检索重排开关与模型（默认 bge-reranker）。
 9. REDIS_URL（推荐）或 REDIS_HOST/REDIS_PORT/REDIS_DB/REDIS_PASSWORD。
 
 ### A.2 启动前检查
 
 1. 确认 OPENAI_API_BASE 不带 /v1。
 2. 确认 QDRANT_COLLECTION 已配置且与预期一致。
-3. local Embedding 模式下，确认模型目录存在且关键文件完整。
+3. 确认 LiteLLM 的 bge-m3 与 bge-reranker 模型在 `litellm/config.yaml` 中可用。
 4. 若使用 Docker，确认网络能访问模型网关、Qdrant、Redis。
 5. 确认日志目录可写（默认 ./logs）。
 

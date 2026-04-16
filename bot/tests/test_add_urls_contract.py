@@ -11,6 +11,8 @@ if str(ROOT_DIR) not in sys.path:
 
 def _stub_module(module_name: str, **attrs):
     module = types.ModuleType(module_name)
+    if module_name in {"langchain", "langchain_community"}:
+        module.__path__ = []
     for key, value in attrs.items():
         setattr(module, key, value)
     sys.modules[module_name] = module
@@ -19,6 +21,8 @@ def _stub_module(module_name: str, **attrs):
 
 if "langchain.text_splitter" not in sys.modules:
     _stub_module("langchain")
+
+    _stub_module("langchain.agents", tool=lambda fn: fn)
 
     class _DummySplitter:
         def __init__(self, *args, **kwargs):
@@ -40,6 +44,13 @@ if "langchain_community.document_loaders" not in sys.modules:
             return []
 
     _stub_module("langchain_community.document_loaders", WebBaseLoader=_DummyWebBaseLoader)
+
+if "langchain_community.utilities" not in sys.modules:
+    class _DummySerpAPIWrapper:
+        def run(self, *args, **kwargs):
+            return ""
+
+    _stub_module("langchain_community.utilities", SerpAPIWrapper=_DummySerpAPIWrapper)
 
 if "langchain_community.vectorstores" not in sys.modules:
     class _DummyQdrant:
@@ -128,6 +139,7 @@ if "app.services.qdrant_service" not in sys.modules:
         recreate_qdrant_collection=lambda collection_name=None: {"ok": True},
         qdrant_health=lambda: {"ok": True},
         qdrant_list_collections=lambda: {"ok": True, "collections": []},
+        qdrant_repo_status=lambda: {"ok": True, "collections": []},
     )
 
 from app import main
@@ -187,8 +199,13 @@ class _DummyQdrantStore:
 
 def _patch_external_deps(monkeypatch):
     monkeypatch.setattr(main, "QdrantClient", _DummyQdrantClient)
-    monkeypatch.setattr(main, "OpenAIEmbeddings", lambda *args, **kwargs: object())
+    monkeypatch.setattr(main, "_build_embeddings_client", lambda *args, **kwargs: object())
     monkeypatch.setattr(main, "Qdrant", _DummyQdrantStore)
+
+
+def _enable_add_urls_write(monkeypatch):
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("ADD_URLS_WRITE_ENABLED", "true")
 
 
 def test_request_model_none_empty_missing_semantics():
@@ -207,6 +224,7 @@ def test_request_model_none_empty_missing_semantics():
 
 def test_add_urls_response_contract(monkeypatch):
     _patch_external_deps(monkeypatch)
+    _enable_add_urls_write(monkeypatch)
     monkeypatch.setattr(
         main,
         "_collect_chunks_from_urls",
@@ -278,6 +296,7 @@ def test_add_urls_dry_run_response_contract(monkeypatch):
 
 def test_add_urls_accepts_query_params(monkeypatch):
     _patch_external_deps(monkeypatch)
+    _enable_add_urls_write(monkeypatch)
     monkeypatch.setattr(
         main,
         "_collect_chunks_from_urls",
@@ -325,3 +344,150 @@ def test_add_urls_dry_run_accepts_query_params(monkeypatch):
     assert body["source_urls"] == 1
     assert body["chunk_strategy"] == "faq"
     assert len(body["chunk_preview"]) == 1
+
+
+def test_add_urls_blocks_private_loopback_and_link_local_urls(monkeypatch):
+    _patch_external_deps(monkeypatch)
+    _enable_add_urls_write(monkeypatch)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/add_urls",
+        json={
+            "urls": ["http://127.0.0.1:8000", "http://169.254.1.2", "http://192.168.1.8"],
+            "chunk_strategy": "balanced",
+        },
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    detail = body["detail"]
+    assert detail["message"] == "URL全部被安全策略拦截"
+    assert len(detail["failed_urls"]) == 3
+    codes = {item["code"] for item in detail["failed_urls"]}
+    assert "BLOCKED_LOOPBACK" in codes
+    assert "BLOCKED_LINK_LOCAL" in codes
+    assert "BLOCKED_PRIVATE_IP" in codes
+
+
+def test_add_urls_blocks_internal_hostname_with_machine_code(monkeypatch):
+    _patch_external_deps(monkeypatch)
+    _enable_add_urls_write(monkeypatch)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/add_urls",
+        json={
+            "url": "http://redis:6379",
+            "chunk_strategy": "balanced",
+        },
+    )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["failed_urls"][0]["code"] == "BLOCKED_INTERNAL_HOST"
+
+
+def test_add_urls_prod_write_disabled_by_default(monkeypatch):
+    _patch_external_deps(monkeypatch)
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.delenv("ADD_URLS_WRITE_ENABLED", raising=False)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/add_urls",
+        json={
+            "url": "https://ok.example",
+            "chunk_strategy": "balanced",
+        },
+    )
+
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Not Found"}
+
+
+def test_add_urls_error_code_enum_contract():
+    expected = {
+        "FETCH_ERROR",
+        "BLOCKED_URL",
+        "INVALID_URL",
+        "UNSUPPORTED_SCHEME",
+        "MISSING_HOST",
+        "INVALID_IP",
+        "BLOCKED_PRIVATE_IP",
+        "BLOCKED_LOOPBACK",
+        "BLOCKED_LINK_LOCAL",
+        "BLOCKED_INTERNAL_HOST",
+    }
+    actual = {item.value for item in main.AddUrlsErrorCode}
+    assert actual == expected
+
+
+def test_prod_only_exposes_chat_endpoint(monkeypatch):
+    monkeypatch.setenv("ENV", "prod")
+
+    client = TestClient(main.app)
+
+    chat_resp = client.post(
+        "/chat",
+        params={
+            "query": "hello",
+            "session_id": "s1",
+        },
+    )
+    assert chat_resp.status_code == 200
+
+    health_resp = client.get("/health/live")
+    assert health_resp.status_code == 404
+
+    add_urls_resp = client.post(
+        "/add_urls",
+        json={
+            "url": "https://ok.example",
+            "chunk_strategy": "balanced",
+        },
+    )
+    assert add_urls_resp.status_code == 404
+
+
+def test_embedding_config_endpoint_returns_effective_config(monkeypatch):
+    monkeypatch.setenv("EMBEDDINGS_MODEL", "bge-m3")
+    monkeypatch.setenv("EMBEDDINGS_DIMENSION", "1024")
+    monkeypatch.setenv("QDRANT_COLLECTION", "web_collection")
+    monkeypatch.setenv("QDRANT_DISTANCE", "cosine")
+
+    client = TestClient(main.app)
+    resp = client.get("/embedding/config")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model"] == "bge-m3"
+    assert body["dimensions"] == 1024
+    assert body["dimension_source"] == "env"
+    assert body["collection"] == "web_collection"
+    assert body["qdrant_distance"] == "cosine"
+
+
+def test_rerank_config_endpoint_returns_direct_upstream_state(monkeypatch):
+    monkeypatch.setenv("RERANK_ENABLED", "true")
+    monkeypatch.setenv("RERANK_DIRECT_UPSTREAM", "true")
+    monkeypatch.setenv("RERANK_MODEL", "bge-reranker")
+    monkeypatch.setenv("RERANK_UPSTREAM_MODEL", "bge-reranker-v2-m3")
+    monkeypatch.setenv("RERANK_API_BASE", "https://api.edgefn.net/v1")
+    monkeypatch.setenv("RERANK_TIMEOUT", "15")
+    monkeypatch.setenv("RERANK_TOP_N", "1")
+    monkeypatch.setenv("RERANK_STARTUP_STRICT", "false")
+
+    client = TestClient(main.app)
+    resp = client.get("/rerank/config")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] is True
+    assert body["direct_upstream"] is True
+    assert body["model"] == "bge-reranker"
+    assert body["upstream_model"] == "bge-reranker-v2-m3"
+    assert body["upstream_base"] == "https://api.edgefn.net/v1"
+    assert body["timeout_seconds"] == 15.0
+    assert body["top_n"] == 1
+    assert body["startup_strict"] is False

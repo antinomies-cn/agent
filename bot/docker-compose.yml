@@ -10,8 +10,16 @@ services:
     environment:
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY}"
       LITELLM_SALT_KEY: "${LITELLM_SALT_KEY}"
-      UPSTREAM_OPENAI_API_KEY: "${UPSTREAM_OPENAI_API_KEY}"
-      UPSTREAM_OPENAI_API_BASE: "${UPSTREAM_OPENAI_API_BASE:-https://api.edgefn.net}"
+      MIN_API_KEY: "${MIN_API_KEY}"
+      MIN_API_BASE: "${MIN_API_BASE}"
+      DEEP_API_KEY: "${DEEP_API_KEY}"
+      DEEP_API_BASE: "${DEEP_API_BASE}"
+      GLM_API_KEY: "${GLM_API_KEY}"
+      GLM_API_BASE: "${GLM_API_BASE}"
+      BGE_API_KEY: "${BGE_API_KEY}"
+      BGE_API_BASE: "${BGE_API_BASE}"
+      RERANK_API_KEY: "${RERANK_API_KEY}"
+      RERANK_API_BASE: "${RERANK_API_BASE}"
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
     healthcheck:
@@ -45,14 +53,15 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import json, urllib.request; r = urllib.request.urlopen('http://localhost:8000/health', timeout=3); d = json.loads(r.read().decode('utf-8')); raise SystemExit(0 if d.get('status') == 'healthy' else 1)\"",
+          "python -c \"import json, urllib.request; r = urllib.request.urlopen('http://localhost:8000/health/live', timeout=5); d = json.loads(r.read().decode('utf-8')); raise SystemExit(0 if d.get('status') == 'healthy' else 1)\"",
         ]
       interval: 10s
-      timeout: 5s
+      timeout: 8s
       retries: 10
       start_period: 20s
+    env_file: .env
     environment:
-      ENV: "dev"
+      ENV: "${ENV:-dev}"
       REDIS_HOST: "myredis"
       REDIS_PORT: "6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD:-64588515}"
@@ -60,16 +69,20 @@ services:
       MEMORY_TTL: "86400"
       MEMORY_COMPACT_MESSAGE_COUNT: "10"
       MOOD_TIMEOUT_SECONDS: "5"
-      OPENAI_API_KEY: "${LITELLM_MASTER_KEY}"
-      OPENAI_API_BASE: "http://litellm:4000"
-      OPENAI_MODEL: "${OPENAI_MODEL}"
-      EMBEDDINGS_API: "${EMBEDDINGS_API:-openai}"
-      EMBEDDINGS_MODEL: "${EMBEDDINGS_MODEL:-text-embedding-3-small}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_API_BASE: "${OPENAI_API_BASE:-http://litellm:4000}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-MiniMax-M2.5}"
+      OPENAI_EMBEDDINGS_API_BASE: "${OPENAI_EMBEDDINGS_API_BASE:-}"
+      EMBEDDINGS_MODEL: "${EMBEDDINGS_MODEL:-bge-m3}"
       EMBEDDINGS_DIMENSION: "${EMBEDDINGS_DIMENSION:-}"
-      EMBEDDINGS_LOCAL_FILES_ONLY: "${EMBEDDINGS_LOCAL_FILES_ONLY:-false}"
+      EMBEDDINGS_TIMEOUT: "${EMBEDDINGS_TIMEOUT:-30}"
       EMBEDDINGS_STARTUP_CHECK: "${EMBEDDINGS_STARTUP_CHECK:-true}"
-      EMBEDDINGS_HF_ENDPOINT: "${EMBEDDINGS_HF_ENDPOINT:-}"
-      EMBEDDINGS_CACHE_DIR: "${EMBEDDINGS_CACHE_DIR:-/app/model_cache}"
+      RERANK_ENABLED: "${RERANK_ENABLED:-true}"
+      RERANK_MODEL: "${RERANK_MODEL:-bge-reranker}"
+      RERANK_UPSTREAM_MODEL: "${RERANK_UPSTREAM_MODEL:-bge-reranker-v2-m3}"
+      RERANK_DIRECT_UPSTREAM: "${RERANK_DIRECT_UPSTREAM:-true}"
+      RERANK_TIMEOUT: "${RERANK_TIMEOUT:-15}"
+      RERANK_TOP_N: "${RERANK_TOP_N:-}"
       SERPAPI_API_KEY: "${SERPAPI_API_KEY:-}"
       QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
       QDRANT_API_KEY: "${QDRANT_API_KEY:-64588515}"
@@ -77,6 +90,7 @@ services:
       XINGPAN_APP_KEY: "${XINGPAN_APP_KEY:-}"
       ASTRO_UID: "${ASTRO_UID:-}"
       WEB_LOADER_VERIFY_SSL: "${WEB_LOADER_VERIFY_SSL:-true}"
+      ADD_URLS_WRITE_ENABLED: "${ADD_URLS_WRITE_ENABLED:-true}"
     depends_on:
       litellm:
         condition: service_healthy

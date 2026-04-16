@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
+from app.core.embedding_config import resolve_embedding_config
 from app.core.logger_setup import logger, log_event
 
 
@@ -18,18 +19,9 @@ def _get_qdrant_client() -> QdrantClient:
     return QdrantClient(path=qdrant_path)
 
 
-def _resolve_vector_size(default_value: int = 384) -> int:
-    """建库维度仅读取 EMBEDDINGS_DIMENSION。"""
-    raw_embedding_dim = os.getenv("EMBEDDINGS_DIMENSION", "").strip()
-    if raw_embedding_dim:
-        try:
-            value = int(raw_embedding_dim)
-            if value > 0:
-                return value
-        except ValueError:
-            pass
-
-    return default_value
+def _resolve_vector_size(default_value: int = 1024) -> int:
+    """建库维度统一走 EmbeddingConfig 策略。"""
+    return resolve_embedding_config(default_dimension=default_value).dimensions
 
 
 def _resolve_distance() -> rest.Distance:
@@ -49,7 +41,7 @@ def init_qdrant_collection(collection_name: Optional[str] = None, force_recreate
     if not target_collection:
         target_collection = "divination_master_collection"
 
-    vector_size = _resolve_vector_size(default_value=384)
+    vector_size = _resolve_vector_size()
     distance = _resolve_distance()
     client = _get_qdrant_client()
 
