@@ -61,6 +61,7 @@ services:
       start_period: 20s
     env_file: .env
     environment:
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
       ENV: "${ENV:-dev}"
       REDIS_HOST: "myredis"
       REDIS_PORT: "6379"
@@ -76,13 +77,16 @@ services:
       EMBEDDINGS_MODEL: "${EMBEDDINGS_MODEL:-bge-m3}"
       EMBEDDINGS_DIMENSION: "${EMBEDDINGS_DIMENSION:-}"
       EMBEDDINGS_TIMEOUT: "${EMBEDDINGS_TIMEOUT:-30}"
+      EMBEDDINGS_RETRY_COUNT: "${EMBEDDINGS_RETRY_COUNT:-1}"
       EMBEDDINGS_STARTUP_CHECK: "${EMBEDDINGS_STARTUP_CHECK:-true}"
       RERANK_ENABLED: "${RERANK_ENABLED:-true}"
       RERANK_MODEL: "${RERANK_MODEL:-bge-reranker}"
       RERANK_UPSTREAM_MODEL: "${RERANK_UPSTREAM_MODEL:-bge-reranker-v2-m3}"
       RERANK_DIRECT_UPSTREAM: "${RERANK_DIRECT_UPSTREAM:-true}"
       RERANK_TIMEOUT: "${RERANK_TIMEOUT:-15}"
+      RERANK_RETRY_COUNT: "${RERANK_RETRY_COUNT:-1}"
       RERANK_TOP_N: "${RERANK_TOP_N:-}"
+      LLM_RETRY_COUNT: "${LLM_RETRY_COUNT:-1}"
       SERPAPI_API_KEY: "${SERPAPI_API_KEY:-}"
       QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
       QDRANT_API_KEY: "${QDRANT_API_KEY:-64588515}"
@@ -90,7 +94,7 @@ services:
       XINGPAN_APP_KEY: "${XINGPAN_APP_KEY:-}"
       ASTRO_UID: "${ASTRO_UID:-}"
       WEB_LOADER_VERIFY_SSL: "${WEB_LOADER_VERIFY_SSL:-true}"
-      ADD_URLS_WRITE_ENABLED: "${ADD_URLS_WRITE_ENABLED:-true}"
+      ADD_URLS_WRITE_ENABLED: "${ADD_URLS_WRITE_ENABLED:-false}"
     depends_on:
       litellm:
         condition: service_healthy

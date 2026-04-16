@@ -2,6 +2,11 @@ import json
 import os
 import logging
 import logging.handlers
+import uuid
+from contextvars import ContextVar
+
+
+_TRACE_ID_CTX: ContextVar[str] = ContextVar("trace_id", default="")
 
 
 def setup_logger():
@@ -49,8 +54,36 @@ def setup_logger():
 logger = setup_logger()
 
 
+def get_trace_id() -> str:
+    trace_id = _TRACE_ID_CTX.get("")
+    if trace_id:
+        return trace_id
+
+    fallback = os.getenv("TRACE_ID", "").strip()
+    if fallback:
+        return fallback
+    return ""
+
+
+def set_trace_id(trace_id: str = "") -> str:
+    value = (trace_id or "").strip() or uuid.uuid4().hex[:16]
+    _TRACE_ID_CTX.set(value)
+    return value
+
+
+def clear_trace_id() -> None:
+    _TRACE_ID_CTX.set("")
+
+
 def log_event(level: int, event: str, **fields) -> None:
     payload = {"event": event}
+    if "component" not in fields:
+        payload["component"] = (event or "unknown").split(".")[0]
+
+    trace_id = fields.get("trace_id") or get_trace_id()
+    if trace_id:
+        payload["trace_id"] = trace_id
+
     for key, value in fields.items():
         payload[key] = value
     logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))

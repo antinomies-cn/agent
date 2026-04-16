@@ -13,7 +13,12 @@ _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BASE_DIR not in sys.path:
     sys.path.insert(0, _BASE_DIR)
 
+from app.core.embedding_config import resolve_embedding_config
 from app.core.logger_setup import logger, log_event
+from app.core.config import (
+    get_embeddings_gateway_settings,
+    get_rerank_gateway_settings,
+)
 
 
 def _load_env_files() -> None:
@@ -42,13 +47,6 @@ def _warn(message: str) -> None:
     log_event(logging.WARNING, "startup_check.warn", message=message)
 
 
-def _normalize_openai_base_url(raw_base_url: str) -> str:
-    base = (raw_base_url or "").strip().rstrip("/")
-    if base.endswith("/v1"):
-        base = base[:-3]
-    return base.rstrip("/")
-
-
 def _fail(message: str) -> int:
     logger.error("startup-check error: %s", message)
     log_event(logging.ERROR, "startup_check.error", message=message)
@@ -64,11 +62,11 @@ def main() -> int:
         log_event(logging.INFO, "startup_check.skip", reason="EMBEDDINGS_STARTUP_CHECK=false")
         return 0
 
-    api_base = _normalize_openai_base_url(
-        os.getenv("OPENAI_EMBEDDINGS_API_BASE", "").strip() or os.getenv("OPENAI_API_BASE", "").strip()
-    )
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    embedding_model = os.getenv("EMBEDDINGS_MODEL", "bge-m3").strip() or "bge-m3"
+    embeddings_cfg = get_embeddings_gateway_settings()
+    resolved_embedding_cfg = resolve_embedding_config(model_name=embeddings_cfg.model)
+    api_base = embeddings_cfg.base_url
+    api_key = embeddings_cfg.api_key
+    embedding_model = resolved_embedding_cfg.model
 
     if not api_base:
         return _fail("OPENAI_API_BASE 未配置")
@@ -135,18 +133,19 @@ def main() -> int:
     if expected_dim and actual_dim != expected_dim:
         return _fail(f"向量维度不匹配: actual={actual_dim}, EMBEDDINGS_DIMENSION={expected_dim}")
 
-    rerank_enabled = _is_true(os.getenv("RERANK_ENABLED", "true"), default=True)
-    rerank_model = os.getenv("RERANK_MODEL", "bge-reranker").strip() or "bge-reranker"
+    rerank_cfg = get_rerank_gateway_settings()
+    rerank_enabled = rerank_cfg.enabled
+    rerank_model = rerank_cfg.model
     rerank_ok = True
     rerank_note = "skipped"
 
     if rerank_enabled:
-        rerank_strict = _is_true(os.getenv("RERANK_STARTUP_STRICT", "false"), default=False)
-        direct_upstream = _is_true(os.getenv("RERANK_DIRECT_UPSTREAM", "true"), default=True)
-        rerank_base = _normalize_openai_base_url(os.getenv("RERANK_API_BASE", "").strip()) if direct_upstream else api_base
-        rerank_api_key = os.getenv("RERANK_API_KEY", "").strip() if direct_upstream else api_key
+        rerank_strict = rerank_cfg.startup_strict
+        direct_upstream = rerank_cfg.direct_upstream
+        rerank_base = rerank_cfg.base_url
+        rerank_api_key = rerank_cfg.api_key
         rerank_body = {
-            "model": (os.getenv("RERANK_UPSTREAM_MODEL", "").strip() or ("bge-reranker-v2-m3" if rerank_model == "bge-reranker" else rerank_model)),
+            "model": rerank_cfg.request_model,
             "query": "startup_check_probe",
             "documents": ["alpha", "beta"],
             "top_n": 1,
@@ -186,11 +185,10 @@ def main() -> int:
         }
 
         last_error = None
-        endpoints = ("/rerank", "/v1/rerank") if direct_upstream else ("/v1/rerank", "/rerank")
-        for endpoint in endpoints:
+        for url in rerank_cfg.endpoint_candidates():
             try:
                 rerank_resp = requests.post(
-                    f"{rerank_base}{endpoint}",
+                    url,
                     headers=rerank_headers,
                     json=rerank_body,
                     timeout=15,
@@ -204,7 +202,7 @@ def main() -> int:
                     results = rerank_payload.get("data") if isinstance(rerank_payload, dict) else None
                 if not isinstance(results, list) or not results:
                     raise RuntimeError("rerank response missing results")
-                rerank_note = endpoint
+                rerank_note = url.replace(rerank_base, "") if rerank_base else url
                 last_error = None
                 break
             except Exception as e:

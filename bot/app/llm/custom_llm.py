@@ -1,4 +1,3 @@
-import os
 import time
 import threading
 import requests
@@ -7,7 +6,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from app.core.config import IS_PROD
+from app.core.config import IS_PROD, get_llm_gateway_settings, normalize_openai_base_url
+from app.core.gateway_http import post_json_with_retry
 from app.core.logger_setup import logger, log_event
 from app.core.texts import USER_MESSAGES
 
@@ -125,21 +125,18 @@ class CustomProxyLLM(BaseChatModel):
 
         return max(timeout_seconds, 3.0)
 
-    @staticmethod
-    def _normalize_base_url(raw_base_url: str) -> str:
-        """规范化 OPENAI_API_BASE，确保配置不包含 /v1。"""
-        base = (raw_base_url or "").strip().rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-        return base.rstrip("/")
-
     def _request_completion(self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs) -> tuple[str, list[dict]]:
         try:
             call_start = time.perf_counter()
+            llm_cfg = get_llm_gateway_settings()
+            effective_api_key = (self.api_key or llm_cfg.api_key or "").strip()
+            effective_base_url = normalize_openai_base_url(self.base_url or llm_cfg.base_url)
+            effective_model = (self.model or llm_cfg.model or "").strip()
+
             required_config = [
-                ("api_key", self.api_key, "模型密钥未配置"),
-                ("base_url", self.base_url, "模型接口地址未配置"),
-                ("model", self.model, "模型名称未配置"),
+                ("api_key", effective_api_key, "模型密钥未配置"),
+                ("base_url", effective_base_url, "模型接口地址未配置"),
+                ("model", effective_model, "模型名称未配置"),
             ]
             for config_key, config_value, error_msg in required_config:
                 if not config_value:
@@ -147,7 +144,7 @@ class CustomProxyLLM(BaseChatModel):
                     return USER_MESSAGES["config"][config_key], []
 
             headers = {
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {effective_api_key}",
                 "Content-Type": "application/json",
                 "User-Agent": "LangChain-CustomLLM/1.0",
             }
@@ -172,7 +169,7 @@ class CustomProxyLLM(BaseChatModel):
                 proxy_messages.append(msg)
 
             data = {
-                "model": self.model,
+                "model": effective_model,
                 "messages": proxy_messages,
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
@@ -186,13 +183,13 @@ class CustomProxyLLM(BaseChatModel):
             if stop:
                 data["stop"] = stop
 
-            normalized_base = self._normalize_base_url(self.base_url)
+            normalized_base = normalize_openai_base_url(effective_base_url)
             url = f"{normalized_base}/v1/chat/completions"
 
             log_event(
                 logging.INFO,
                 "llm.request",
-                model=self.model,
+                model=effective_model,
                 message_count=len(proxy_messages),
             )
 
@@ -202,47 +199,16 @@ class CustomProxyLLM(BaseChatModel):
 
             timeout_seconds = self._resolve_timeout_seconds()
 
-            try:
-                max_retries = int(os.getenv("LLM_RETRY_COUNT", "1"))
-            except ValueError:
-                max_retries = 1
-            max_retries = max(0, max_retries)
-            retry_status_codes = {429, 500, 502, 503, 504}
-
-            last_http_error = None
-            resp = None
-            for attempt in range(max_retries + 1):
-                try:
-                    resp = requests.post(url, headers=headers, json=data, timeout=timeout_seconds)
-                    resp.raise_for_status()
-                    break
-                except requests.exceptions.HTTPError as e:
-                    last_http_error = e
-                    status_code = e.response.status_code if e.response is not None else 0
-                    should_retry = status_code in retry_status_codes and attempt < max_retries
-                    if not should_retry:
-                        raise
-
-                    sleep_seconds = min(1.5, 0.3 * (attempt + 1))
-                    logger.warning(
-                        "LLM调用触发重试 | attempt: %s/%s | status: %s | backoff: %.1fs",
-                        attempt + 1,
-                        max_retries + 1,
-                        status_code,
-                        sleep_seconds,
-                    )
-                    log_event(
-                        logging.WARNING,
-                        "llm.retry",
-                        attempt=attempt + 1,
-                        max_retries=max_retries + 1,
-                        status_code=status_code,
-                        backoff_seconds=sleep_seconds,
-                    )
-                    time.sleep(sleep_seconds)
-
-            if last_http_error is not None and resp is None:
-                raise last_http_error
+            max_retries = llm_cfg.retry_count
+            resp = post_json_with_retry(
+                url=url,
+                headers=headers,
+                body=data,
+                timeout_seconds=timeout_seconds,
+                retry_count=max_retries,
+                component="llm",
+                operation="chat_completion",
+            )
 
             if not IS_PROD:
                 logger.debug("LLM响应状态码: %s", resp.status_code)
@@ -261,7 +227,7 @@ class CustomProxyLLM(BaseChatModel):
             log_event(
                 logging.INFO,
                 "llm.success",
-                model=self.model,
+                model=effective_model,
                 tool_calls=len(tool_calls),
                 output_len=len(content),
                 elapsed_ms=int(elapsed * 1000),

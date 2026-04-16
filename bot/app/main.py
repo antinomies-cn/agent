@@ -26,6 +26,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, project_root)
 
 from app.core.embedding_config import resolve_embedding_config
+from app.core.config import get_rerank_gateway_settings
 from app.core.logger_setup import logger, log_event
 from app.core.litellm_adapters import build_litellm_embeddings_client
 from app.services.master_service import Master
@@ -1852,44 +1853,17 @@ def embedding_config() -> EmbeddingConfigResponse:
 )
 def rerank_config() -> RerankConfigResponse:
     """读取当前生效 rerank 配置，用于排查 rerank 路由与直连状态。"""
-    enabled = os.getenv("RERANK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-    direct_upstream = os.getenv("RERANK_DIRECT_UPSTREAM", "true").strip().lower() in {"1", "true", "yes", "on"}
-    model = os.getenv("RERANK_MODEL", "bge-reranker").strip() or "bge-reranker"
-    upstream_model = os.getenv("RERANK_UPSTREAM_MODEL", "").strip()
-    if not upstream_model:
-        upstream_model = "bge-reranker-v2-m3" if model == "bge-reranker" else model
-
-    upstream_base = os.getenv("RERANK_API_BASE", "").strip() if direct_upstream else os.getenv("OPENAI_API_BASE", "").strip()
-    if upstream_base.endswith("/"):
-        upstream_base = upstream_base.rstrip("/")
-
-    top_n_raw = os.getenv("RERANK_TOP_N", "").strip()
-    top_n = None
-    if top_n_raw:
-        try:
-            top_n = int(top_n_raw)
-        except ValueError:
-            top_n = None
-
-    timeout_seconds = 15.0
-    raw_timeout = os.getenv("RERANK_TIMEOUT", "15").strip()
-    if raw_timeout:
-        try:
-            timeout_seconds = float(raw_timeout)
-        except ValueError:
-            timeout_seconds = 15.0
-
-    startup_strict = os.getenv("RERANK_STARTUP_STRICT", "false").strip().lower() in {"1", "true", "yes", "on"}
+    cfg = get_rerank_gateway_settings()
 
     return RerankConfigResponse(
-        enabled=enabled,
-        direct_upstream=direct_upstream,
-        model=model,
-        upstream_model=upstream_model,
-        upstream_base=upstream_base,
-        timeout_seconds=timeout_seconds,
-        top_n=top_n,
-        startup_strict=startup_strict,
+        enabled=cfg.enabled,
+        direct_upstream=cfg.direct_upstream,
+        model=cfg.model,
+        upstream_model=cfg.upstream_model,
+        upstream_base=cfg.display_base_url,
+        timeout_seconds=cfg.timeout_seconds,
+        top_n=cfg.top_n,
+        startup_strict=cfg.startup_strict,
     )
 
 @app.get("/health", summary="服务健康检查", description="检查服务与LLM连通性，返回运行状态。")

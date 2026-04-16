@@ -22,7 +22,7 @@ from app.tools.mytools import (
     vector_search,
     xingpan,
 )
-from app.core.config import IS_PROD
+from app.core.config import IS_PROD, get_llm_gateway_settings
 from app.llm.custom_llm import CustomProxyLLM, _thread_ctx
 from app.core.logger_setup import logger
 from app.core.texts import MOOD_CLASSIFY_PROMPT, MOODS, SYSTEMPL, USER_MESSAGES
@@ -53,16 +53,18 @@ class Master:
         return f"redis://:{password}@{host}:{port}/{db}"
 
     def __init__(self):
+        llm_cfg = get_llm_gateway_settings()
+
         self.normal_llm = CustomProxyLLM(
-            api_key=os.getenv("OPENAI_API_KEY", ""),
-            base_url=os.getenv("OPENAI_API_BASE", ""),
-            model=os.getenv("OPENAI_MODEL", ""),
+            api_key=llm_cfg.api_key,
+            base_url=llm_cfg.base_url,
+            model=llm_cfg.model,
         )
 
         self.mood_llm = CustomProxyLLM(
-            api_key=os.getenv("OPENAI_API_KEY", ""),
-            base_url=os.getenv("OPENAI_API_BASE", ""),
-            model=os.getenv("OPENAI_MODEL", ""),
+            api_key=llm_cfg.api_key,
+            base_url=llm_cfg.base_url,
+            model=llm_cfg.model,
             temperature=0.0,
             max_tokens=12,
         )
