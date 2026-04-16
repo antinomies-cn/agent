@@ -24,7 +24,6 @@ if __package__ in (None, ""):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from app.core.config import IS_PROD
 from app.core.embedding_config import resolve_embedding_config
 from app.core.logger_setup import logger, log_event
 from app.core.litellm_adapters import build_litellm_embeddings_client
@@ -51,18 +50,18 @@ from app.services.qdrant_service import (
 )
 from app.core.texts import USER_MESSAGES
 
+
+def _is_prod_runtime() -> bool:
+    return os.getenv("ENV", "dev").strip().lower() == "prod"
+
 app = FastAPI(
-    docs_url=None if IS_PROD else "/docs",
-    redoc_url=None if IS_PROD else "/redoc",
-    openapi_url=None if IS_PROD else "/openapi.json",
+    docs_url=None if _is_prod_runtime() else "/docs",
+    redoc_url=None if _is_prod_runtime() else "/redoc",
+    openapi_url=None if _is_prod_runtime() else "/openapi.json",
 )
 master = Master()
 
 _PROD_ALLOWED_HTTP_PATHS = {"/chat"}
-
-
-def _is_prod_runtime() -> bool:
-    return os.getenv("ENV", "dev").strip().lower() == "prod"
 
 
 @app.middleware("http")
@@ -219,7 +218,7 @@ class ToolAstroChartRequest(BaseModel):
 
 
 def _ensure_debug_tools_enabled():
-    if IS_PROD:
+    if _is_prod_runtime():
         raise HTTPException(status_code=404, detail="Not Found")
 
 
@@ -438,8 +437,7 @@ def _partition_safe_urls(clean_url_list: List[str]) -> tuple[List[str], List[Dic
 
 def _ensure_add_urls_write_enabled() -> None:
     """生产环境默认关闭入库，需显式开关开启。"""
-    env_name = os.getenv("ENV", "dev").strip().lower()
-    is_prod_runtime = env_name == "prod"
+    is_prod_runtime = _is_prod_runtime()
     write_enabled = _is_truthy_env(os.getenv("ADD_URLS_WRITE_ENABLED", "false"))
     if is_prod_runtime and not write_enabled:
         raise HTTPException(
@@ -1695,7 +1693,7 @@ async def health_check():
             "status": "healthy",
             "timestamp": time.time(),
             "llm_status": llm_status,
-            "env": "production" if IS_PROD else "development"
+            "env": "production" if _is_prod_runtime() else "development"
         }
         logger.info(f"健康检查 | 状态: {health_info}")
         return health_info
@@ -1714,7 +1712,7 @@ def health_live():
     return {
         "status": "healthy",
         "timestamp": time.time(),
-        "env": "production" if IS_PROD else "development",
+        "env": "production" if _is_prod_runtime() else "development",
     }
 
 @app.get("/memory/status", summary="会话记忆状态", description="按 session_id 查询会话记忆状态。")

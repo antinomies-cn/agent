@@ -2,6 +2,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -388,6 +389,42 @@ def test_add_urls_blocks_internal_hostname_with_machine_code(monkeypatch):
     assert detail["failed_urls"][0]["code"] == "BLOCKED_INTERNAL_HOST"
 
 
+def test_add_urls_blocks_unsupported_scheme_with_machine_code(monkeypatch):
+    _patch_external_deps(monkeypatch)
+    _enable_add_urls_write(monkeypatch)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/add_urls",
+        json={
+            "url": "ftp://example.com/resource.txt",
+            "chunk_strategy": "balanced",
+        },
+    )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["failed_urls"][0]["code"] == "UNSUPPORTED_SCHEME"
+
+
+def test_add_urls_blocks_missing_host_with_machine_code(monkeypatch):
+    _patch_external_deps(monkeypatch)
+    _enable_add_urls_write(monkeypatch)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/add_urls",
+        json={
+            "url": "http:///path-only",
+            "chunk_strategy": "balanced",
+        },
+    )
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["failed_urls"][0]["code"] == "MISSING_HOST"
+
+
 def test_add_urls_prod_write_disabled_by_default(monkeypatch):
     _patch_external_deps(monkeypatch)
     monkeypatch.setenv("ENV", "prod")
@@ -448,6 +485,23 @@ def test_prod_only_exposes_chat_endpoint(monkeypatch):
         },
     )
     assert add_urls_resp.status_code == 404
+
+
+def test_is_prod_runtime_uses_env_value(monkeypatch):
+    monkeypatch.setenv("ENV", "PrOd")
+    assert main._is_prod_runtime() is True
+
+    monkeypatch.setenv("ENV", "dev")
+    assert main._is_prod_runtime() is False
+
+
+def test_ws_is_rejected_in_prod(monkeypatch):
+    monkeypatch.setenv("ENV", "prod")
+    client = TestClient(main.app)
+
+    with pytest.raises(Exception):
+        with client.websocket_connect("/ws?session_id=s1"):
+            pass
 
 
 def test_embedding_config_endpoint_returns_effective_config(monkeypatch):

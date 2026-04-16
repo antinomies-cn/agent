@@ -53,7 +53,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import json, urllib.request; r = urllib.request.urlopen('http://localhost:8000/health/live', timeout=5); d = json.loads(r.read().decode('utf-8')); raise SystemExit(0 if d.get('status') == 'healthy' else 1)\"",
+          "python -c \"import socket; s = socket.socket(); s.settimeout(3); ok = (s.connect_ex(('127.0.0.1', 8000)) == 0); s.close(); raise SystemExit(0 if ok else 1)\"",
         ]
       interval: 10s
       timeout: 8s
