@@ -10,6 +10,7 @@ import requests
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from langchain.text_splitter import RecursiveCharacterTextSplitter  
 from langchain_community.document_loaders import WebBaseLoader
@@ -63,12 +64,108 @@ master = Master()
 
 _PROD_ALLOWED_HTTP_PATHS = {"/chat"}
 
+_COMMON_ERROR_EXPLANATIONS = {
+    "ROUTE_NOT_EXPOSED": "生产环境仅暴露 /chat 接口，当前路由不可访问。",
+    "DEBUG_TOOL_DISABLED": "调试接口仅在开发环境开放，请在 dev 环境调用。",
+    "INVALID_SESSION_ID": "请提供非空 session_id，用于会话隔离与上下文追踪。",
+    "CHAT_RUNTIME_ERROR": "对话处理失败，请稍后重试或检查模型与网络配置。",
+    "QDRANT_INIT_ERROR": "Qdrant 初始化失败，请检查连接、鉴权与集合配置。",
+    "QDRANT_RECREATE_ERROR": "Qdrant 重建失败，请检查集合状态与权限配置。",
+    "QDRANT_HEALTH_ERROR": "Qdrant 健康检查失败，请检查服务可达性。",
+    "QDRANT_COLLECTIONS_ERROR": "Qdrant 集合读取失败，请检查连接与权限。",
+    "QDRANT_STATUS_ERROR": "Qdrant 状态读取失败，请检查连接与权限。",
+    "MEMORY_STATUS_ERROR": "会话记忆读取失败，请检查 Redis/内存后端状态。",
+    "HEALTH_CHECK_ERROR": "健康检查内部执行失败，请查看服务日志定位原因。",
+    "TOOL_UNKNOWN_ERROR": "工具执行失败，请检查输入参数与依赖服务状态。",
+    "REQUEST_VALIDATION_ERROR": "请求参数校验失败，请检查必填项、字段类型与取值范围。",
+    "HTTP_400": "请求参数不合法，请检查输入内容。",
+    "HTTP_401": "鉴权失败，请检查认证信息。",
+    "HTTP_403": "当前请求无权限执行。",
+    "HTTP_404": "目标资源不存在或当前环境不开放该接口。",
+    "HTTP_409": "请求与当前资源状态冲突，请调整后重试。",
+    "HTTP_422": "请求参数校验失败，请检查请求体结构与字段类型。",
+    "HTTP_500": "服务内部错误，请稍后重试。",
+    "INTERNAL_SERVER_ERROR": "服务内部发生未预期错误，请稍后重试。",
+}
+
 
 @app.middleware("http")
 async def _restrict_routes_in_prod(request: Request, call_next):
     if _is_prod_runtime() and request.url.path not in _PROD_ALLOWED_HTTP_PATHS:
-        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        return JSONResponse(
+            status_code=404,
+            content={
+                "detail": "Not Found",
+                "error_code": "ROUTE_NOT_EXPOSED",
+                "explanation": _COMMON_ERROR_EXPLANATIONS["ROUTE_NOT_EXPOSED"],
+            },
+        )
     return await call_next(request)
+
+
+def _resolve_explanation_by_error_code(error_code: str) -> str:
+    code = (error_code or "").strip()
+    if code in _COMMON_ERROR_EXPLANATIONS:
+        return _COMMON_ERROR_EXPLANATIONS[code]
+    return "请求处理失败，请查看错误信息并联系管理员。"
+
+
+def _normalize_http_exception_payload(status_code: int, detail: Any) -> Dict[str, Any]:
+    if isinstance(detail, dict):
+        payload = dict(detail)
+        error_code = payload.get("error_code") or f"HTTP_{status_code}"
+        explanation = payload.get("explanation") or _resolve_explanation_by_error_code(str(error_code))
+        if "message" not in payload and "detail" not in payload:
+            payload["message"] = "请求处理失败"
+        return {
+            "detail": payload,
+            "error_code": str(error_code),
+            "explanation": explanation,
+        }
+
+    if isinstance(detail, list):
+        return {
+            "detail": "请求参数校验失败",
+            "error_code": "REQUEST_VALIDATION_ERROR",
+            "explanation": _resolve_explanation_by_error_code("REQUEST_VALIDATION_ERROR"),
+            "errors": detail,
+        }
+
+    text = str(detail or "请求处理失败")
+    code = f"HTTP_{status_code}"
+    return {
+        "detail": text,
+        "error_code": code,
+        "explanation": _resolve_explanation_by_error_code(code),
+    }
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    payload = _normalize_http_exception_payload(exc.status_code, exc.detail)
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    payload = {
+        "detail": "请求参数校验失败",
+        "error_code": "REQUEST_VALIDATION_ERROR",
+        "explanation": _resolve_explanation_by_error_code("REQUEST_VALIDATION_ERROR"),
+        "errors": exc.errors(),
+    }
+    return JSONResponse(status_code=422, content=payload)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error("未捕获异常 | path: %s | err: %s", request.url.path, str(exc)[:200], exc_info=True)
+    payload = {
+        "detail": "Internal Server Error",
+        "error_code": "INTERNAL_SERVER_ERROR",
+        "explanation": _resolve_explanation_by_error_code("INTERNAL_SERVER_ERROR"),
+    }
+    return JSONResponse(status_code=500, content=payload)
 
 
 class AddUrlsErrorCode(str, Enum):
@@ -82,6 +179,20 @@ class AddUrlsErrorCode(str, Enum):
     BLOCKED_LOOPBACK = "BLOCKED_LOOPBACK"
     BLOCKED_LINK_LOCAL = "BLOCKED_LINK_LOCAL"
     BLOCKED_INTERNAL_HOST = "BLOCKED_INTERNAL_HOST"
+
+
+_ADD_URLS_ERROR_EXPLANATIONS = {
+    AddUrlsErrorCode.FETCH_ERROR.value: "目标地址访问失败或内容解析失败，请检查URL可访问性、SSL配置和页面结构。",
+    AddUrlsErrorCode.BLOCKED_URL.value: "URL被安全策略拦截，请更换为可公开访问的HTTP/HTTPS地址。",
+    AddUrlsErrorCode.INVALID_URL.value: "URL格式无法解析，请检查是否为完整地址。",
+    AddUrlsErrorCode.UNSUPPORTED_SCHEME.value: "仅支持HTTP/HTTPS协议，请调整URL协议。",
+    AddUrlsErrorCode.MISSING_HOST.value: "URL缺少主机名，请提供包含域名或IP的完整地址。",
+    AddUrlsErrorCode.INVALID_IP.value: "IP地址格式无效，请检查IP是否正确。",
+    AddUrlsErrorCode.BLOCKED_PRIVATE_IP.value: "检测到私网地址，为避免内网探测风险已拒绝访问。",
+    AddUrlsErrorCode.BLOCKED_LOOPBACK.value: "检测到环回地址，为避免访问本机服务已拒绝。",
+    AddUrlsErrorCode.BLOCKED_LINK_LOCAL.value: "检测到链路本地地址，为避免访问局域网络设备已拒绝。",
+    AddUrlsErrorCode.BLOCKED_INTERNAL_HOST.value: "检测到疑似内网主机名（无公网域名特征），已按策略拦截。",
+}
 
 
 class AddUrlsRequest(BaseModel):
@@ -111,6 +222,7 @@ class FailedUrlItem(BaseModel):
     url: str = Field(description="失败URL")
     code: AddUrlsErrorCode = Field(default=AddUrlsErrorCode.FETCH_ERROR, description="失败类型编码")
     error: str = Field(description="失败原因")
+    explanation: str = Field(default="", description="错误解释与处理建议")
 
 
 class ChunkConfigModel(BaseModel):
@@ -219,7 +331,26 @@ class ToolAstroChartRequest(BaseModel):
 
 def _ensure_debug_tools_enabled():
     if _is_prod_runtime():
-        raise HTTPException(status_code=404, detail="Not Found")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Not Found",
+                "error_code": "DEBUG_TOOL_DISABLED",
+                "explanation": _COMMON_ERROR_EXPLANATIONS["DEBUG_TOOL_DISABLED"],
+            },
+        )
+
+
+def _tool_error_explanation(code: str, error: str) -> str:
+    if not error:
+        return ""
+    if code == "CONFIG_MISSING":
+        return "工具配置缺失，请检查相关环境变量。"
+    if code == "TIMEOUT":
+        return "工具调用超时，请稍后重试或上调超时参数。"
+    if code.startswith("HTTP_"):
+        return "上游服务返回HTTP错误，请检查上游可用性和鉴权。"
+    return _COMMON_ERROR_EXPLANATIONS["TOOL_UNKNOWN_ERROR"]
 
 
 def _wrap_tool_result(tool_name: str, raw_result: Any) -> Dict[str, Any]:
@@ -231,15 +362,19 @@ def _wrap_tool_result(tool_name: str, raw_result: Any) -> Dict[str, Any]:
             parsed = None
 
     if isinstance(parsed, dict) and {"ok", "code", "data", "error"}.issubset(parsed.keys()):
-        return {"tool": tool_name, **parsed}
+        wrapped = {"tool": tool_name, **parsed}
+        wrapped["explanation"] = _tool_error_explanation(str(wrapped.get("code", "")), str(wrapped.get("error", "")))
+        return wrapped
 
-    return {
+    wrapped = {
         "tool": tool_name,
         "ok": True,
         "code": "OK",
         "data": parsed if parsed is not None else raw_result,
         "error": "",
     }
+    wrapped["explanation"] = ""
+    return wrapped
 
 
 def _resolve_add_urls_payload(
@@ -358,6 +493,32 @@ def _is_truthy_env(value: Optional[str]) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _get_add_urls_error_explanation(code: Optional[str]) -> str:
+    clean_code = (code or "").strip()
+    if clean_code in _ADD_URLS_ERROR_EXPLANATIONS:
+        return _ADD_URLS_ERROR_EXPLANATIONS[clean_code]
+    return "未知错误类型，请查看 error 字段并联系管理员排查。"
+
+
+def _normalize_failed_urls(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """统一补全 failed_urls 的 code/explanation，避免调用方分支判断复杂化。"""
+    normalized: List[Dict[str, str]] = []
+    for item in items or []:
+        url = str((item or {}).get("url", "") or "")
+        code = str((item or {}).get("code", AddUrlsErrorCode.FETCH_ERROR.value) or AddUrlsErrorCode.FETCH_ERROR.value)
+        error = str((item or {}).get("error", "") or "")
+        explanation = str((item or {}).get("explanation", "") or "")
+        normalized.append(
+            {
+                "url": url,
+                "code": code,
+                "error": error,
+                "explanation": explanation or _get_add_urls_error_explanation(code),
+            }
+        )
+    return normalized
+
+
 def _is_public_http_url(raw_url: str) -> tuple[bool, Optional[AddUrlsErrorCode], str]:
     """阻断私网/环回/链路本地地址，降低 SSRF 风险。"""
     try:
@@ -430,6 +591,7 @@ def _partition_safe_urls(clean_url_list: List[str]) -> tuple[List[str], List[Dic
                     "url": one_url,
                     "code": (code or AddUrlsErrorCode.BLOCKED_URL).value,
                     "error": reason[:120],
+                    "explanation": _get_add_urls_error_explanation((code or AddUrlsErrorCode.BLOCKED_URL).value),
                 }
             )
     return allowed_urls, blocked_urls
@@ -463,7 +625,14 @@ def _collect_chunks_from_urls(clean_url_list: List[str], chunk_cfg: Dict[str, An
             documents = web_loader.load()
             all_chunks.extend(_chunk_documents(documents, one_url, chunk_cfg, strategy))
         except Exception as e:
-            failed_urls.append({"url": one_url, "code": AddUrlsErrorCode.FETCH_ERROR.value, "error": str(e)[:400]})
+            failed_urls.append(
+                {
+                    "url": one_url,
+                    "code": AddUrlsErrorCode.FETCH_ERROR.value,
+                    "error": str(e)[:400],
+                    "explanation": _get_add_urls_error_explanation(AddUrlsErrorCode.FETCH_ERROR.value),
+                }
+            )
     return all_chunks, failed_urls
 
 
@@ -762,7 +931,14 @@ def chat(query: str, session_id: str):
     """处理一次对话请求并返回模型回复。"""
     logger.info(f"接收Chat API请求 | session_id: {session_id} | 查询: {query[:100]}")
     if not session_id.strip():
-        raise HTTPException(status_code=400, detail="session_id不能为空")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "session_id不能为空",
+                "error_code": "INVALID_SESSION_ID",
+                "explanation": _COMMON_ERROR_EXPLANATIONS["INVALID_SESSION_ID"],
+            },
+        )
     try:
         res = master.run(query, session_id=session_id)
         response_text = res.get("output", "")
@@ -771,7 +947,15 @@ def chat(query: str, session_id: str):
     except Exception as e:
         error_msg = str(e)[:100]
         logger.error(f"Chat API执行异常 | 查询: {query[:50]} | 错误: {error_msg}", exc_info=True)
-        return {"code": 500, "session_id": session_id, "query": query, "response": f"错误：{error_msg}"}
+        return {
+            "code": 500,
+            "error_code": "CHAT_RUNTIME_ERROR",
+            "explanation": _COMMON_ERROR_EXPLANATIONS["CHAT_RUNTIME_ERROR"],
+            "error": error_msg,
+            "session_id": session_id,
+            "query": query,
+            "response": f"错误：{error_msg}",
+        }
 
 
 @app.post("/tools/test", summary="工具调试：系统自检", description="调用 test 工具，支持 scope=all|astro|vector|search 用于快速排查配置。")
@@ -1249,6 +1433,7 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
         raise HTTPException(status_code=400, detail="请提供url或urls参数")
 
     clean_url_list, blocked_urls = _partition_safe_urls(clean_url_list)
+    blocked_urls = _normalize_failed_urls(blocked_urls)
     if not clean_url_list:
         raise HTTPException(
             status_code=400,
@@ -1274,7 +1459,7 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
 
     collect_start = time.perf_counter()
     all_chunks, failed_urls = _collect_chunks_from_urls(clean_url_list, chunk_cfg, payload.chunk_strategy)
-    failed_urls = [*blocked_urls, *failed_urls]
+    failed_urls = _normalize_failed_urls([*blocked_urls, *failed_urls])
     quality_report = _compute_chunk_quality_report(all_chunks, failed_urls)
     collect_ms = int((time.perf_counter() - collect_start) * 1000)
     log_event(
@@ -1443,6 +1628,7 @@ def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload
         raise HTTPException(status_code=400, detail="请提供url或urls参数")
 
     clean_url_list, blocked_urls = _partition_safe_urls(clean_url_list)
+    blocked_urls = _normalize_failed_urls(blocked_urls)
     if not clean_url_list:
         raise HTTPException(
             status_code=400,
@@ -1460,7 +1646,7 @@ def add_urls_dry_run(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload
     )
     collect_start = time.perf_counter()
     all_chunks, failed_urls = _collect_chunks_from_urls(clean_url_list, chunk_cfg, payload.chunk_strategy)
-    failed_urls = [*blocked_urls, *failed_urls]
+    failed_urls = _normalize_failed_urls([*blocked_urls, *failed_urls])
     quality_report = _compute_chunk_quality_report(all_chunks, failed_urls)
     log_event(
         logging.INFO,
@@ -1555,7 +1741,12 @@ def init_qdrant(
     except Exception as e:
         err = str(e)[:120]
         logger.error("Qdrant初始化失败 | err: %s", err, exc_info=True)
-        return {"code": 500, "error": err}
+        return {
+            "code": 500,
+            "error_code": "QDRANT_INIT_ERROR",
+            "error": err,
+            "explanation": _COMMON_ERROR_EXPLANATIONS["QDRANT_INIT_ERROR"],
+        }
 
 
 @app.post(
@@ -1575,7 +1766,12 @@ def recreate_qdrant(
     except Exception as e:
         err = str(e)[:120]
         logger.error("Qdrant重建失败 | err: %s", err, exc_info=True)
-        return {"code": 500, "error": err}
+        return {
+            "code": 500,
+            "error_code": "QDRANT_RECREATE_ERROR",
+            "error": err,
+            "explanation": _COMMON_ERROR_EXPLANATIONS["QDRANT_RECREATE_ERROR"],
+        }
 
 @app.get("/qdrant/health", summary="Qdrant健康检查", description="检查Qdrant连通性与可用性。")
 def qdrant_health_check():
@@ -1587,7 +1783,12 @@ def qdrant_health_check():
     except Exception as e:
         err = str(e)[:120]
         logger.error("Qdrant健康检查失败 | err: %s", err, exc_info=True)
-        return {"code": 500, "error": err}
+        return {
+            "code": 500,
+            "error_code": "QDRANT_HEALTH_ERROR",
+            "error": err,
+            "explanation": _COMMON_ERROR_EXPLANATIONS["QDRANT_HEALTH_ERROR"],
+        }
 
 @app.get("/qdrant/collections", summary="Qdrant集合列表", description="列出当前Qdrant中的集合。")
 def qdrant_collections():
@@ -1599,7 +1800,12 @@ def qdrant_collections():
     except Exception as e:
         err = str(e)[:120]
         logger.error("Qdrant collections失败 | err: %s", err, exc_info=True)
-        return {"code": 500, "error": err}
+        return {
+            "code": 500,
+            "error_code": "QDRANT_COLLECTIONS_ERROR",
+            "error": err,
+            "explanation": _COMMON_ERROR_EXPLANATIONS["QDRANT_COLLECTIONS_ERROR"],
+        }
 
 
 @app.get("/qdrant/status", summary="Qdrant状态", description="获取Qdrant仓库的轻量状态信息。")
@@ -1612,7 +1818,12 @@ def qdrant_status():
     except Exception as e:
         err = str(e)[:120]
         logger.error("Qdrant status失败 | err: %s", err, exc_info=True)
-        return {"code": 500, "error": err}
+        return {
+            "code": 500,
+            "error_code": "QDRANT_STATUS_ERROR",
+            "error": err,
+            "explanation": _COMMON_ERROR_EXPLANATIONS["QDRANT_STATUS_ERROR"],
+        }
 
 
 @app.get(
@@ -1702,7 +1913,9 @@ async def health_check():
         return {
             "status": "unhealthy",
             "timestamp": time.time(),
-            "error": str(e)[:100]
+            "error": str(e)[:100],
+            "error_code": "HEALTH_CHECK_ERROR",
+            "explanation": _COMMON_ERROR_EXPLANATIONS["HEALTH_CHECK_ERROR"],
         }
 
 
@@ -1719,7 +1932,14 @@ def health_live():
 def memory_status(session_id: str):
     """查看指定session的memory状态。"""
     if not session_id.strip():
-        raise HTTPException(status_code=400, detail="session_id不能为空")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "session_id不能为空",
+                "error_code": "INVALID_SESSION_ID",
+                "explanation": _COMMON_ERROR_EXPLANATIONS["INVALID_SESSION_ID"],
+            },
+        )
     try:
         status = master.get_memory_status(session_id)
         logger.info("memory状态查询成功 | session_id: %s | count: %s", status["session_id"], status["message_count"])
@@ -1727,7 +1947,13 @@ def memory_status(session_id: str):
     except Exception as e:
         err = str(e)[:120]
         logger.error("memory状态查询失败 | session_id: %s | err: %s", session_id, err, exc_info=True)
-        return {"code": 500, "session_id": session_id, "error": err}
+        return {
+            "code": 500,
+            "error_code": "MEMORY_STATUS_ERROR",
+            "session_id": session_id,
+            "error": err,
+            "explanation": _COMMON_ERROR_EXPLANATIONS["MEMORY_STATUS_ERROR"],
+        }
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):

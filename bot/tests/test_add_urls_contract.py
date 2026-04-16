@@ -252,6 +252,9 @@ def test_add_urls_response_contract(monkeypatch):
     assert isinstance(body["chunks"], int)
     assert isinstance(body["failed_urls"], list)
     assert body["failed_urls"]
+    assert "explanation" in body["failed_urls"][0]
+    assert isinstance(body["failed_urls"][0]["explanation"], str)
+    assert body["failed_urls"][0]["explanation"]
     assert isinstance(body["chunk_config"], dict)
     assert set(body["chunk_config"].keys()) == {"chunk_size", "chunk_overlap", "separators"}
 
@@ -369,6 +372,7 @@ def test_add_urls_blocks_private_loopback_and_link_local_urls(monkeypatch):
     assert "BLOCKED_LOOPBACK" in codes
     assert "BLOCKED_LINK_LOCAL" in codes
     assert "BLOCKED_PRIVATE_IP" in codes
+    assert all(item.get("explanation") for item in detail["failed_urls"])
 
 
 def test_add_urls_blocks_internal_hostname_with_machine_code(monkeypatch):
@@ -387,6 +391,7 @@ def test_add_urls_blocks_internal_hostname_with_machine_code(monkeypatch):
     assert resp.status_code == 400
     detail = resp.json()["detail"]
     assert detail["failed_urls"][0]["code"] == "BLOCKED_INTERNAL_HOST"
+    assert detail["failed_urls"][0]["explanation"]
 
 
 def test_add_urls_blocks_unsupported_scheme_with_machine_code(monkeypatch):
@@ -405,6 +410,7 @@ def test_add_urls_blocks_unsupported_scheme_with_machine_code(monkeypatch):
     assert resp.status_code == 400
     detail = resp.json()["detail"]
     assert detail["failed_urls"][0]["code"] == "UNSUPPORTED_SCHEME"
+    assert detail["failed_urls"][0]["explanation"]
 
 
 def test_add_urls_blocks_missing_host_with_machine_code(monkeypatch):
@@ -423,6 +429,7 @@ def test_add_urls_blocks_missing_host_with_machine_code(monkeypatch):
     assert resp.status_code == 400
     detail = resp.json()["detail"]
     assert detail["failed_urls"][0]["code"] == "MISSING_HOST"
+    assert detail["failed_urls"][0]["explanation"]
 
 
 def test_add_urls_prod_write_disabled_by_default(monkeypatch):
@@ -440,7 +447,10 @@ def test_add_urls_prod_write_disabled_by_default(monkeypatch):
     )
 
     assert resp.status_code == 404
-    assert resp.json() == {"detail": "Not Found"}
+    detail = resp.json()
+    assert detail["detail"] == "Not Found"
+    assert detail["error_code"] == "ROUTE_NOT_EXPOSED"
+    assert detail["explanation"]
 
 
 def test_add_urls_error_code_enum_contract():
@@ -460,6 +470,30 @@ def test_add_urls_error_code_enum_contract():
     assert actual == expected
 
 
+def test_http_exception_string_detail_is_normalized(monkeypatch):
+    monkeypatch.setenv("ENV", "dev")
+    client = TestClient(main.app)
+
+    resp = client.post("/add_urls", json={"chunk_strategy": "balanced"})
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["detail"] == "请提供url或urls参数"
+    assert body["error_code"] == "HTTP_400"
+    assert body["explanation"]
+
+
+def test_request_validation_error_is_normalized():
+    client = TestClient(main.app)
+
+    # 缺少 query/session_id，触发 FastAPI 的 422 校验异常。
+    resp = client.post("/chat")
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error_code"] == "REQUEST_VALIDATION_ERROR"
+    assert body["explanation"]
+    assert isinstance(body["errors"], list)
+
+
 def test_prod_only_exposes_chat_endpoint(monkeypatch):
     monkeypatch.setenv("ENV", "prod")
 
@@ -476,6 +510,9 @@ def test_prod_only_exposes_chat_endpoint(monkeypatch):
 
     health_resp = client.get("/health/live")
     assert health_resp.status_code == 404
+    health_detail = health_resp.json()
+    assert health_detail["error_code"] == "ROUTE_NOT_EXPOSED"
+    assert health_detail["explanation"]
 
     add_urls_resp = client.post(
         "/add_urls",
@@ -485,6 +522,9 @@ def test_prod_only_exposes_chat_endpoint(monkeypatch):
         },
     )
     assert add_urls_resp.status_code == 404
+    add_urls_detail = add_urls_resp.json()
+    assert add_urls_detail["error_code"] == "ROUTE_NOT_EXPOSED"
+    assert add_urls_detail["explanation"]
 
 
 def test_is_prod_runtime_uses_env_value(monkeypatch):
@@ -502,6 +542,36 @@ def test_ws_is_rejected_in_prod(monkeypatch):
     with pytest.raises(Exception):
         with client.websocket_connect("/ws?session_id=s1"):
             pass
+
+
+def test_chat_returns_error_explanation_when_runtime_fails(monkeypatch):
+    def _raise_error(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main.master, "run", _raise_error)
+    client = TestClient(main.app)
+    resp = client.post("/chat", params={"query": "hi", "session_id": "s1"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 500
+    assert body["error_code"] == "CHAT_RUNTIME_ERROR"
+    assert body["explanation"]
+
+
+def test_qdrant_init_returns_error_explanation_on_failure(monkeypatch):
+    def _raise_error(*args, **kwargs):
+        raise RuntimeError("qdrant down")
+
+    monkeypatch.setattr(main, "init_qdrant_collection", _raise_error)
+    client = TestClient(main.app)
+    resp = client.post("/qdrant/init")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 500
+    assert body["error_code"] == "QDRANT_INIT_ERROR"
+    assert body["explanation"]
 
 
 def test_embedding_config_endpoint_returns_effective_config(monkeypatch):
