@@ -1,4 +1,3 @@
-import os
 import json
 import time
 import importlib.util
@@ -6,6 +5,7 @@ import logging
 import threading
 import requests
 from datetime import datetime
+from app.core.logger_setup import summarize_error_for_log, summarize_text_for_log
 from langchain.agents import tool
 from langchain_community.utilities import SerpAPIWrapper
 from langchain_community.vectorstores import Qdrant
@@ -20,6 +20,22 @@ logger = logging.getLogger(__name__)
 # ===================== retriever初始化 =====================
 _vector_retriever = None
 _vector_retriever_lock = threading.Lock()
+
+
+def reset_vector_retriever_cache() -> bool:
+    """清理进程内向量检索器缓存，返回是否实际清理。"""
+    global _vector_retriever
+    with _vector_retriever_lock:
+        had_cache = _vector_retriever is not None
+        _vector_retriever = None
+
+    log_event(
+        logging.INFO,
+        "vector_retriever.cache_reset",
+        had_cache=had_cache,
+    )
+    logger.info("向量检索器缓存已重置 | had_cache: %s", had_cache)
+    return had_cache
 
 
 def _build_embeddings_client(default_dimensions: int = 384):
@@ -39,17 +55,14 @@ def _build_embeddings_client(default_dimensions: int = 384):
 
 def _rerank_documents_if_enabled(query: str, docs: list):
     """按环境开关执行 rerank，失败时回退原顺序。"""
-    enabled = os.getenv("RERANK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    enabled = _app_config.get_env_bool("RERANK_ENABLED", default=True)
     if not enabled or not docs:
         return docs
 
     texts = [getattr(doc, "page_content", "") or "" for doc in docs]
-    try:
-        base_top_k = int(os.getenv("VECTOR_SEARCH_TOP_K", "4") or "4")
-    except ValueError:
-        base_top_k = 4
+    base_top_k = _app_config.get_env_int("VECTOR_SEARCH_TOP_K", default=4, min_value=1)
     top_n = min(len(texts), max(1, base_top_k))
-    raw_top_n = os.getenv("RERANK_TOP_N", "").strip()
+    raw_top_n = _app_config.get_env_str("RERANK_TOP_N", "")
     if raw_top_n:
         try:
             top_n = min(len(texts), max(1, int(raw_top_n)))
@@ -112,18 +125,15 @@ def _normalize_birth_dt(raw: str) -> str:
 
 def _astro_base_url() -> str:
     """获取星盘服务基础地址。"""
-    return os.getenv("XINGPAN_API_URL", "https://cloud.apiworks.com/open/astro").rstrip("/")
+    return _app_config.get_env_str("XINGPAN_API_URL", "https://cloud.apiworks.com/open/astro").rstrip("/")
 
 
 def _request_astro_api(path: str, method: str = "POST", payload: dict | None = None) -> str:
     """统一封装星盘接口调用。"""
     api_url = f"{_astro_base_url()}/{path.lstrip('/')}"
-    app_id = os.getenv("XINGPAN_APP_ID", "")
-    app_key = os.getenv("XINGPAN_APP_KEY", "")
-    try:
-        timeout_seconds = float(os.getenv("XINGPAN_TIMEOUT", "15"))
-    except ValueError:
-        timeout_seconds = 15.0
+    app_id = _app_config.get_env_str("XINGPAN_APP_ID", "")
+    app_key = _app_config.get_env_str("XINGPAN_APP_KEY", "")
+    timeout_seconds = _app_config.get_env_float("XINGPAN_TIMEOUT", default=15.0, min_value=1.0)
 
     if not app_id or not app_key:
         logger.error("星盘工具配置缺失 | XINGPAN_APP_ID/XINGPAN_APP_KEY 未设置")
@@ -244,14 +254,12 @@ def _get_vector_retriever():
         if _vector_retriever is not None:
             return _vector_retriever
 
-        qdrant_url = os.getenv("QDRANT_URL", "").strip()
-        qdrant_api_key = os.getenv("QDRANT_API_KEY", "").strip()
-        db_path = os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db")
-        collection_name = os.getenv("QDRANT_COLLECTION", "divination_master_collection")
-        try:
-            top_k = int(os.getenv("VECTOR_SEARCH_TOP_K", "4"))
-        except ValueError:
-            top_k = 4
+        qdrant_settings = _app_config.get_qdrant_settings()
+        qdrant_url = qdrant_settings.url
+        qdrant_api_key = qdrant_settings.api_key
+        db_path = qdrant_settings.path
+        collection_name = qdrant_settings.collection
+        top_k = _app_config.get_env_int("VECTOR_SEARCH_TOP_K", default=4, min_value=1)
 
         init_start = time.perf_counter()
         if qdrant_url:
@@ -314,15 +322,15 @@ def test(scope: str = "all") -> str:
     if clean_scope in {"all", "astro"}:
         astro_ok = True
         missing = []
-        if not os.getenv("XINGPAN_APP_ID", "").strip():
+        if not _app_config.get_env_str("XINGPAN_APP_ID", ""):
             missing.append("XINGPAN_APP_ID")
             astro_ok = False
-        if not os.getenv("XINGPAN_APP_KEY", "").strip():
+        if not _app_config.get_env_str("XINGPAN_APP_KEY", ""):
             missing.append("XINGPAN_APP_KEY")
             astro_ok = False
 
-        uid = os.getenv("ASTRO_UID", "").strip()
-        timeout_text = os.getenv("XINGPAN_TIMEOUT", "15")
+        uid = _app_config.get_env_str("ASTRO_UID", "")
+        timeout_text = _app_config.get_env_str("XINGPAN_TIMEOUT", "15")
         try:
             timeout_seconds = float(timeout_text)
         except ValueError:
@@ -331,9 +339,9 @@ def test(scope: str = "all") -> str:
         probe_ok = False
         probe_msg = ""
         if astro_ok and uid:
-            probe_birth_dt = os.getenv("ASTRO_BIRTH_DT", "").strip()
-            probe_lng = os.getenv("ASTRO_LONGITUDE", "").strip()
-            probe_lat = os.getenv("ASTRO_LATITUDE", "").strip()
+            probe_birth_dt = _app_config.get_env_str("ASTRO_BIRTH_DT", "")
+            probe_lng = _app_config.get_env_str("ASTRO_LONGITUDE", "")
+            probe_lat = _app_config.get_env_str("ASTRO_LATITUDE", "")
             if not (probe_birth_dt and probe_lng and probe_lat):
                 probe_msg = "缺少 ASTRO_BIRTH_DT/ASTRO_LONGITUDE/ASTRO_LATITUDE，跳过接口探测"
             else:
@@ -384,14 +392,14 @@ def test(scope: str = "all") -> str:
 
         report["checks"]["vector"] = {
             "ok": vector_ok,
-            "collection": os.getenv("QDRANT_COLLECTION", "divination_master_collection"),
-            "db_path": os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db"),
+            "collection": _app_config.get_qdrant_settings().collection,
+            "db_path": _app_config.get_qdrant_settings().path,
             "error": vector_error,
         }
         report["ok"] = report["ok"] and vector_ok
 
     if clean_scope in {"all", "search"}:
-        has_key = bool(os.getenv("SERPAPI_API_KEY", "").strip())
+        has_key = bool(_app_config.get_env_str("SERPAPI_API_KEY", ""))
         serpapi_installed = importlib.util.find_spec("serpapi") is not None
         search_ok = has_key and serpapi_installed
         report["checks"]["search"] = {
@@ -417,16 +425,25 @@ def search(query: str) -> str:
         start_time = time.perf_counter()
         serp = SerpAPIWrapper()
         result = serp.run(clean_query)
-        logger.info(f"执行搜索工具 | 查询: {clean_query[:50]} | 结果: {str(result)[:100]}")
+        logger.info(
+            "执行搜索工具 | 查询: %s | 结果: %s",
+            summarize_text_for_log(clean_query, preview_chars=24),
+            summarize_text_for_log(str(result), preview_chars=24),
+        )
         log_event(
             logging.INFO,
             "tool.search",
             query_len=len(clean_query),
             elapsed_ms=int((time.perf_counter() - start_time) * 1000),
         )
-        return str(result)
+        return result
     except Exception as e:
-        logger.error(f"搜索工具异常 | 查询: {clean_query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
+        logger.error(
+            "搜索工具异常 | 查询: %s | 错误: %s",
+            summarize_text_for_log(clean_query, preview_chars=24),
+            summarize_error_for_log(str(e)),
+            exc_info=True,
+        )
         log_event(
             logging.ERROR,
             "tool.search.error",
@@ -452,7 +469,7 @@ def vector_search(query: str) -> str:
         ).strip()
 
         if not result:
-            logger.info(f"执行向量搜索工具 | 查询: {clean_query[:50]} | 命中: 0")
+            logger.info("执行向量搜索工具 | 查询: %s | 命中: 0", summarize_text_for_log(clean_query, preview_chars=24))
             log_event(
                 logging.INFO,
                 "tool.vector_search",
@@ -462,7 +479,11 @@ def vector_search(query: str) -> str:
             )
             return "未检索到相关内容。"
 
-        logger.info(f"执行向量搜索工具 | 查询: {clean_query[:50]} | 结果长度: {len(result)}")
+        logger.info(
+            "执行向量搜索工具 | 查询: %s | 结果长度: %s",
+            summarize_text_for_log(clean_query, preview_chars=24),
+            len(result),
+        )
         log_event(
             logging.INFO,
             "tool.vector_search",
@@ -472,7 +493,12 @@ def vector_search(query: str) -> str:
         )
         return result
     except Exception as e:
-        logger.error(f"向量搜索工具异常 | 查询: {clean_query[:50]} | 错误: {str(e)[:100]}", exc_info=True)
+        logger.error(
+            "向量搜索工具异常 | 查询: %s | 错误: %s",
+            summarize_text_for_log(clean_query, preview_chars=24),
+            summarize_error_for_log(str(e)),
+            exc_info=True,
+        )
         log_event(
             logging.ERROR,
             "tool.vector_search.error",
@@ -508,8 +534,7 @@ def xingpan(name: str, birth_dt: str, longitude: float, latitude: float) -> str:
 @tool
 def astro_my_sign(birth_dt: str, longitude: float, latitude: float) -> str:
     """星座信息工具：当用户查询星座信息时使用。uid 从 .env 读取。"""
-    uid = os.getenv("ASTRO_UID", "")
-    uid = uid.strip()
+    uid = _app_config.get_env_str("ASTRO_UID", "")
     if not uid:
         return "请在 .env 中配置 ASTRO_UID 后再查询星座信息。"
 
@@ -579,8 +604,7 @@ def astro_transit_chart(birth_dt: str, longitude: float, latitude: float) -> str
 @tool
 def astro_day_scope() -> str:
     """日运势工具：读取 ASTRO_UID 获取日运势。"""
-    uid = os.getenv("ASTRO_UID", "")
-    uid = uid.strip()
+    uid = _app_config.get_env_str("ASTRO_UID", "")
     if not uid:
         return "请在 .env 中配置 ASTRO_UID 后再查询日运势。"
     return _request_astro_api(f"scope/day/{uid}", method="GET")
@@ -589,8 +613,7 @@ def astro_day_scope() -> str:
 @tool
 def astro_week_scope() -> str:
     """周运势工具：读取 ASTRO_UID 获取周运势。"""
-    uid = os.getenv("ASTRO_UID", "")
-    uid = uid.strip()
+    uid = _app_config.get_env_str("ASTRO_UID", "")
     if not uid:
         return "请在 .env 中配置 ASTRO_UID 后再查询周运势。"
     return _request_astro_api(f"scope/week/{uid}", method="GET")
@@ -599,8 +622,7 @@ def astro_week_scope() -> str:
 @tool
 def astro_month_scope() -> str:
     """月运势工具：读取 ASTRO_UID 获取月运势。"""
-    uid = os.getenv("ASTRO_UID", "")
-    uid = uid.strip()
+    uid = _app_config.get_env_str("ASTRO_UID", "")
     if not uid:
         return "请在 .env 中配置 ASTRO_UID 后再查询月运势。"
     return _request_astro_api(f"scope/month/{uid}", method="GET")

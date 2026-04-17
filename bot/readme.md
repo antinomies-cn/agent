@@ -228,8 +228,12 @@ POST /add_urls/dry_run?url=https://example.com/a&chunk_strategy=faq&preview_limi
 1. WEB_LOADER_VERIFY_SSL：是否启用网页抓取 SSL 校验。
 2. EMBEDDINGS_STARTUP_CHECK：LiteLLM embedding/rerank 启动前自检开关。
 3. ADD_URLS_WRITE_ENABLED：生产环境是否允许 /add_urls 入库，默认 false（需显式设为 true 才可写库）。
-4. /add_urls 与 /add_urls/dry_run 会阻断私网/环回/链路本地地址，以及疑似内网主机名（如 redis）。
-5. 被拦截 URL 会返回机读 code（如 BLOCKED_PRIVATE_IP、BLOCKED_LOOPBACK、BLOCKED_LINK_LOCAL、BLOCKED_INTERNAL_HOST）。
+4. ADD_URLS_FETCH_TIMEOUT_SECONDS：单个 URL 抓取超时秒数，默认 10。
+5. ADD_URLS_FETCH_RETRY_COUNT：单个 URL 的失败重试次数，默认 2。
+6. ADD_URLS_FETCH_BACKOFF_SECONDS：重试退避基准秒数，默认 1。
+7. ADD_URLS_MAX_CONTENT_CHARS：单个页面正文最大保留字符数，默认 20000。
+8. /add_urls 与 /add_urls/dry_run 会阻断私网/环回/链路本地地址，以及疑似内网主机名（如 redis）。
+9. 被拦截 URL 会返回机读 code（如 BLOCKED_PRIVATE_IP、BLOCKED_LOOPBACK、BLOCKED_LINK_LOCAL、BLOCKED_INTERNAL_HOST）。
 
 ### 占星接口本地连通性（Windows curl）
 
@@ -509,6 +513,16 @@ flowchart TD
 
 ```powershell
 C:/ProgramData/anaconda3/envs/agentenv/python.exe -m pytest
+```
+
+也可以直接使用仓库内固定入口（推荐）：
+
+```powershell
+./run_tests.ps1 -q
+```
+
+```cmd
+run_tests.cmd -q
 ```
 
 ### C.2 仅查看 Qdrant 相关日志（容器场景）

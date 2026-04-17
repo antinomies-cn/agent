@@ -38,8 +38,9 @@ if "langchain_community.document_loaders" not in sys.modules:
     _stub_module("langchain_community")
 
     class _DummyWebBaseLoader:
-        def __init__(self, url):
+        def __init__(self, url, **kwargs):
             self.url = url
+            self.kwargs = kwargs
 
         def load(self):
             return []
@@ -350,6 +351,69 @@ def test_add_urls_dry_run_accepts_query_params(monkeypatch):
     assert len(body["chunk_preview"]) == 1
 
 
+def test_add_urls_retries_transient_loader_failure(monkeypatch):
+    _patch_external_deps(monkeypatch)
+    _enable_add_urls_write(monkeypatch)
+    monkeypatch.setenv("ADD_URLS_FETCH_RETRY_COUNT", "2")
+    monkeypatch.setenv("ADD_URLS_FETCH_TIMEOUT_SECONDS", "1")
+
+    attempts = {"count": 0}
+
+    class _FlakyWebBaseLoader:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.kwargs = kwargs
+
+        def load(self):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise RuntimeError("temporary fetch error")
+            return [_FakeChunk("retry succeeded", {"source_url": self.url})]
+
+    monkeypatch.setattr(main, "WebBaseLoader", _FlakyWebBaseLoader)
+
+    chunks, failed_urls = main._collect_chunks_from_urls(
+        ["https://ok.example"],
+        main._build_chunking_config("balanced"),
+        "balanced",
+    )
+
+    assert attempts["count"] == 3
+    assert len(failed_urls) == 0
+    assert len(chunks) == 1
+    assert chunks[0].page_content == "retry succeeded"
+
+
+def test_add_urls_truncates_long_content_before_chunking(monkeypatch):
+    _patch_external_deps(monkeypatch)
+    _enable_add_urls_write(monkeypatch)
+    monkeypatch.setenv("ADD_URLS_MAX_CONTENT_CHARS", "10")
+    monkeypatch.setenv("ADD_URLS_FETCH_RETRY_COUNT", "0")
+
+    class _LongContentWebBaseLoader:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.kwargs = kwargs
+
+        def load(self):
+            return [_FakeChunk("0123456789abcdef", {"source_url": self.url})]
+
+    monkeypatch.setattr(main, "WebBaseLoader", _LongContentWebBaseLoader)
+
+    chunks, failed_urls = main._collect_chunks_from_urls(
+        ["https://ok.example"],
+        main._build_chunking_config("balanced"),
+        "balanced",
+    )
+
+    assert len(failed_urls) == 0
+    assert len(chunks) == 1
+    assert chunks[0].page_content == "0123456789"
+    assert chunks[0].metadata["content_truncated"] is True
+    assert chunks[0].metadata["content_original_length"] == 16
+    assert chunks[0].metadata["content_max_length"] == 10
+
+
 def test_add_urls_blocks_private_loopback_and_link_local_urls(monkeypatch):
     _patch_external_deps(monkeypatch)
     _enable_add_urls_write(monkeypatch)
@@ -615,3 +679,41 @@ def test_rerank_config_endpoint_returns_direct_upstream_state(monkeypatch):
     assert body["timeout_seconds"] == 15.0
     assert body["top_n"] == 1
     assert body["startup_strict"] is False
+
+
+def test_config_health_endpoint_returns_summary(monkeypatch):
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("API_HOST", "127.0.0.1")
+    monkeypatch.setenv("API_PORT", "8000")
+    monkeypatch.setenv("QDRANT_COLLECTION", "web_collection")
+    monkeypatch.setenv("QDRANT_DISTANCE", "cosine")
+
+    client = TestClient(main.app)
+    resp = client.get("/config/health")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 200
+    assert "data" in body
+    assert body["data"]["ok"] is True
+    assert "highlights" in body["data"]
+    assert body["data"]["highlights"]["env"] == "dev"
+    assert body["data"]["highlights"]["qdrant_collection"] == "web_collection"
+
+
+def test_cors_preflight_passes_when_gateway_auth_enabled(monkeypatch):
+    monkeypatch.setenv("GATEWAY_AUTH_ENABLED", "true")
+    monkeypatch.setenv("GATEWAY_AUTH_TOKENS", "token-a")
+    monkeypatch.setattr(main, "gateway_security_settings", main.get_gateway_security_settings())
+
+    client = TestClient(main.app)
+    resp = client.options(
+        "/chat",
+        headers={
+            "Origin": "https://example.com",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert resp.status_code in {200, 204}
+    assert "access-control-allow-origin" in {k.lower() for k in resp.headers.keys()}

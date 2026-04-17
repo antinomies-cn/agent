@@ -1,8 +1,10 @@
 import os
+import asyncio
 import json
 import sys
 import time
 import logging
+import hashlib
 import socket
 import ipaddress
 from enum import Enum
@@ -11,6 +13,7 @@ from urllib.parse import urlparse
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from langchain.text_splitter import RecursiveCharacterTextSplitter  
 from langchain_community.document_loaders import WebBaseLoader
@@ -26,8 +29,28 @@ if __package__ in (None, ""):
         sys.path.insert(0, project_root)
 
 from app.core.embedding_config import resolve_embedding_config
-from app.core.config import get_rerank_gateway_settings
-from app.core.logger_setup import logger, log_event
+from app.core.config import (
+    build_config_health_summary,
+    get_env_float,
+    get_env_int,
+    get_gateway_security_settings,
+    get_qdrant_settings,
+    get_rerank_gateway_settings,
+    get_runtime_settings,
+    get_server_settings,
+    is_prod_runtime,
+)
+from app.core.gateway_security import (
+    FixedWindowRateLimiter,
+    build_http_audit_context,
+    ensure_body_size_limit,
+    ensure_http_auth,
+    ensure_http_rate_limit,
+    ensure_websocket_auth,
+    ensure_ws_rate_limit,
+    log_http_gateway_audit,
+)
+from app.core.logger_setup import logger, log_event, mask_session_id, summarize_text_for_log, summarize_error_for_log
 from app.core.litellm_adapters import build_litellm_embeddings_client
 from app.services.master_service import Master
 from app.tools.mytools import (
@@ -54,14 +77,42 @@ from app.core.texts import USER_MESSAGES
 
 
 def _is_prod_runtime() -> bool:
-    return os.getenv("ENV", "dev").strip().lower() == "prod"
+    return is_prod_runtime()
 
 app = FastAPI(
     docs_url=None if _is_prod_runtime() else "/docs",
     redoc_url=None if _is_prod_runtime() else "/redoc",
     openapi_url=None if _is_prod_runtime() else "/openapi.json",
 )
+
+gateway_security_settings = get_gateway_security_settings()
+gateway_rate_limiter = FixedWindowRateLimiter()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(gateway_security_settings.cors_allow_origins),
+    allow_credentials=gateway_security_settings.cors_allow_credentials,
+    allow_methods=list(gateway_security_settings.cors_allow_methods),
+    allow_headers=list(gateway_security_settings.cors_allow_headers),
+)
+
 master = Master()
+
+
+def _log_config_health_summary() -> None:
+    summary = build_config_health_summary()
+    level = logging.INFO if summary.get("ok", False) else logging.ERROR
+    log_event(
+        level,
+        "config.health.summary",
+        ok=bool(summary.get("ok", False)),
+        warnings=list(summary.get("warnings", ())),
+        errors=list(summary.get("errors", ())),
+        **dict(summary.get("highlights", {})),
+    )
+
+
+_log_config_health_summary()
 
 _PROD_ALLOWED_HTTP_PATHS = {"/chat"}
 
@@ -85,9 +136,24 @@ _COMMON_ERROR_EXPLANATIONS = {
     "HTTP_404": "目标资源不存在或当前环境不开放该接口。",
     "HTTP_409": "请求与当前资源状态冲突，请调整后重试。",
     "HTTP_422": "请求参数校验失败，请检查请求体结构与字段类型。",
+    "HTTP_429": "请求频率过高，请稍后重试。",
+    "HTTP_413": "请求体超出限制，请缩减请求大小。",
     "HTTP_500": "服务内部错误，请稍后重试。",
+    "HTTP_504": "请求处理超时，请稍后重试。",
     "INTERNAL_SERVER_ERROR": "服务内部发生未预期错误，请稍后重试。",
+    "GATEWAY_AUTH_FAILED": "网关鉴权失败，请检查访问凭据。",
+    "GATEWAY_RATE_LIMIT_IP": "请求频率过高（IP维度），请稍后重试。",
+    "GATEWAY_RATE_LIMIT_SESSION": "请求频率过高（会话维度），请稍后重试。",
+    "GATEWAY_BODY_TOO_LARGE": "请求体过大，请缩减后重试。",
+    "GATEWAY_TIMEOUT": "网关请求超时，请稍后重试。",
 }
+
+
+def _safe_session_hash(session_id: str) -> str:
+    text = (session_id or "").strip()
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 @app.middleware("http")
@@ -102,6 +168,98 @@ async def _restrict_routes_in_prod(request: Request, call_next):
             },
         )
     return await call_next(request)
+
+
+_GATEWAY_EXEMPT_PATHS = {
+    "/",
+    "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/favicon.ico",
+}
+
+
+@app.middleware("http")
+async def _gateway_guard(request: Request, call_next):
+    # CORS preflight must pass through auth/rate-limit checks.
+    if request.method.upper() == "OPTIONS":
+        return await call_next(request)
+
+    path = request.url.path
+    if path in _GATEWAY_EXEMPT_PATHS:
+        return await call_next(request)
+
+    # Keep existing prod 404 behavior for non-exposed routes.
+    if _is_prod_runtime() and path not in _PROD_ALLOWED_HTTP_PATHS:
+        return await call_next(request)
+
+    start = time.perf_counter()
+    auth_scheme = "none"
+    audit_ctx = None
+    try:
+        ensure_body_size_limit(gateway_security_settings, request)
+        auth_scheme = ensure_http_auth(gateway_security_settings, request)
+        ensure_http_rate_limit(gateway_security_settings, request, gateway_rate_limiter)
+
+        audit_ctx = build_http_audit_context(
+            request=request,
+            auth_scheme=auth_scheme,
+            trust_proxy_headers=gateway_security_settings.trust_proxy_headers,
+        )
+        request.state.request_id = audit_ctx.request_id
+
+        timeout_seconds = gateway_security_settings.request_timeout_seconds
+        if timeout_seconds and timeout_seconds > 0:
+            response = await asyncio.wait_for(call_next(request), timeout=timeout_seconds)
+        else:
+            response = await call_next(request)
+        if audit_ctx is not None:
+            response.headers["X-Request-Id"] = audit_ctx.request_id
+            log_http_gateway_audit(
+                logging.INFO,
+                "gateway.request",
+                ctx=audit_ctx,
+                status_code=response.status_code,
+                elapsed_ms=int((time.perf_counter() - start) * 1000),
+            )
+        return response
+    except HTTPException as exc:
+        if audit_ctx is None:
+            audit_ctx = build_http_audit_context(
+                request=request,
+                auth_scheme=auth_scheme,
+                trust_proxy_headers=gateway_security_settings.trust_proxy_headers,
+            )
+        log_http_gateway_audit(
+            logging.WARNING,
+            "gateway.request.blocked",
+            ctx=audit_ctx,
+            status_code=exc.status_code,
+            elapsed_ms=int((time.perf_counter() - start) * 1000),
+        )
+        raise
+    except asyncio.TimeoutError:
+        if audit_ctx is None:
+            audit_ctx = build_http_audit_context(
+                request=request,
+                auth_scheme=auth_scheme,
+                trust_proxy_headers=gateway_security_settings.trust_proxy_headers,
+            )
+        log_http_gateway_audit(
+            logging.WARNING,
+            "gateway.request.timeout",
+            ctx=audit_ctx,
+            status_code=504,
+            elapsed_ms=int((time.perf_counter() - start) * 1000),
+        )
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "message": "网关请求超时",
+                "error_code": "GATEWAY_TIMEOUT",
+            },
+        )
 
 
 def _resolve_explanation_by_error_code(error_code: str) -> str:
@@ -490,8 +648,20 @@ def _normalize_urls(payload: AddUrlsRequest) -> List[str]:
     return clean_url_list
 
 
-def _is_truthy_env(value: Optional[str]) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+def _get_add_urls_fetch_timeout_seconds() -> float:
+    return get_env_float("ADD_URLS_FETCH_TIMEOUT_SECONDS", default=10.0, min_value=1.0)
+
+
+def _get_add_urls_fetch_retry_count() -> int:
+    return get_env_int("ADD_URLS_FETCH_RETRY_COUNT", default=2, min_value=0)
+
+
+def _get_add_urls_fetch_backoff_seconds() -> float:
+    return get_env_float("ADD_URLS_FETCH_BACKOFF_SECONDS", default=1.0, min_value=0.0)
+
+
+def _get_add_urls_max_content_chars() -> int:
+    return get_env_int("ADD_URLS_MAX_CONTENT_CHARS", default=20000, min_value=1)
 
 
 def _get_add_urls_error_explanation(code: Optional[str]) -> str:
@@ -600,9 +770,8 @@ def _partition_safe_urls(clean_url_list: List[str]) -> tuple[List[str], List[Dic
 
 def _ensure_add_urls_write_enabled() -> None:
     """生产环境默认关闭入库，需显式开关开启。"""
-    is_prod_runtime = _is_prod_runtime()
-    write_enabled = _is_truthy_env(os.getenv("ADD_URLS_WRITE_ENABLED", "false"))
-    if is_prod_runtime and not write_enabled:
+    runtime_settings = get_runtime_settings()
+    if runtime_settings.is_prod and not runtime_settings.add_urls_write_enabled:
         raise HTTPException(
             status_code=403,
             detail={
@@ -616,24 +785,83 @@ def _collect_chunks_from_urls(clean_url_list: List[str], chunk_cfg: Dict[str, An
     """按URL抓取并切块，返回成功chunk与失败URL详情。"""
     all_chunks = []
     failed_urls = []
-    verify_ssl = os.getenv("WEB_LOADER_VERIFY_SSL", "true").strip().lower() not in {"0", "false", "no", "off"}
+    verify_ssl = get_runtime_settings().web_loader_verify_ssl
+    fetch_timeout_seconds = _get_add_urls_fetch_timeout_seconds()
+    fetch_retry_count = _get_add_urls_fetch_retry_count()
+    fetch_backoff_seconds = _get_add_urls_fetch_backoff_seconds()
+    max_content_chars = _get_add_urls_max_content_chars()
     if not verify_ssl:
         logger.warning("WebBaseLoader SSL校验已关闭（WEB_LOADER_VERIFY_SSL=false），仅建议临时排障使用")
 
     for one_url in clean_url_list:
-        try:
-            web_loader = WebBaseLoader(one_url, verify_ssl=verify_ssl)
-            documents = web_loader.load()
-            all_chunks.extend(_chunk_documents(documents, one_url, chunk_cfg, strategy))
-        except Exception as e:
+        last_error: Optional[Exception] = None
+        documents = None
+        for attempt in range(fetch_retry_count + 1):
+            try:
+                web_loader = WebBaseLoader(
+                    one_url,
+                    verify_ssl=verify_ssl,
+                    continue_on_failure=False,
+                    raise_for_status=True,
+                    requests_kwargs={"timeout": fetch_timeout_seconds},
+                )
+                documents = web_loader.load()
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < fetch_retry_count:
+                    sleep_seconds = fetch_backoff_seconds * (2 ** attempt)
+                    logger.warning(
+                        "URL抓取失败，准备重试 | url: %s | attempt: %s/%s | sleep_seconds: %.2f | err: %s",
+                        one_url,
+                        attempt + 1,
+                        fetch_retry_count + 1,
+                        sleep_seconds,
+                        str(exc)[:200],
+                    )
+                    if sleep_seconds > 0:
+                        time.sleep(sleep_seconds)
+                    continue
+
+        if documents is None:
             failed_urls.append(
                 {
                     "url": one_url,
                     "code": AddUrlsErrorCode.FETCH_ERROR.value,
-                    "error": str(e)[:400],
+                    "error": str(last_error)[:400] if last_error else "抓取失败",
                     "explanation": _get_add_urls_error_explanation(AddUrlsErrorCode.FETCH_ERROR.value),
                 }
             )
+            continue
+
+        truncated_docs = 0
+        normalized_documents = []
+        for doc in documents:
+            page_content = getattr(doc, "page_content", "")
+            if not isinstance(page_content, str):
+                page_content = str(page_content or "")
+            original_length = len(page_content)
+            if original_length > max_content_chars:
+                page_content = page_content[:max_content_chars]
+                truncated_docs += 1
+            doc.page_content = page_content
+            if original_length > max_content_chars:
+                metadata = dict(getattr(doc, "metadata", {}) or {})
+                metadata["content_truncated"] = True
+                metadata["content_original_length"] = original_length
+                metadata["content_max_length"] = max_content_chars
+                doc.metadata = metadata
+            normalized_documents.append(doc)
+
+        if truncated_docs:
+            logger.info(
+                "URL内容已截断以控制最大长度 | url: %s | truncated_docs: %s | max_content_chars: %s",
+                one_url,
+                truncated_docs,
+                max_content_chars,
+            )
+
+        all_chunks.extend(_chunk_documents(normalized_documents, one_url, chunk_cfg, strategy))
     return all_chunks, failed_urls
 
 
@@ -777,11 +1005,12 @@ def _extract_collection_vector_size(collection_info: Any) -> Optional[int]:
 
 
 def _fetch_collection_vector_size_via_http(collection_name: str) -> Optional[int]:
-    qdrant_url = os.getenv("QDRANT_URL", "").strip()
+    qdrant_settings = get_qdrant_settings()
+    qdrant_url = qdrant_settings.url
     if not qdrant_url:
         return None
 
-    api_key = os.getenv("QDRANT_API_KEY", "").strip()
+    api_key = qdrant_settings.api_key
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["api-key"] = api_key
@@ -852,7 +1081,7 @@ def _is_vector_dim_mismatch_error(error: Exception) -> bool:
 
 def _resolve_qdrant_distance() -> Any:
     """解析Qdrant距离度量，默认使用Cosine。"""
-    distance_name = os.getenv("QDRANT_DISTANCE", "Cosine").strip().lower()
+    distance_name = get_qdrant_settings().distance
     distance_map = {
         "cosine": rest.Distance.COSINE,
         "dot": rest.Distance.DOT,
@@ -930,7 +1159,12 @@ def read_root():
 @app.post("/chat", summary="对话接口", description="主对话入口。query 为用户输入，session_id 用于会话隔离。")
 def chat(query: str, session_id: str):
     """处理一次对话请求并返回模型回复。"""
-    logger.info(f"接收Chat API请求 | session_id: {session_id} | 查询: {query[:100]}")
+    sid_hash = _safe_session_hash(session_id)
+    logger.info(
+        "接收Chat API请求 | session_id: %s | query: %s",
+        mask_session_id(session_id),
+        summarize_text_for_log(query, preview_chars=24),
+    )
     if not session_id.strip():
         raise HTTPException(
             status_code=400,
@@ -943,11 +1177,21 @@ def chat(query: str, session_id: str):
     try:
         res = master.run(query, session_id=session_id)
         response_text = res.get("output", "")
-        logger.info(f"Chat API响应成功 | session_id: {session_id} | 查询: {query[:50]} | 响应长度: {len(response_text)}")
+        logger.info(
+            "Chat API响应成功 | session_id: %s | response: %s",
+            mask_session_id(session_id),
+            summarize_text_for_log(response_text, preview_chars=24),
+        )
         return {"code": 200, "session_id": session_id, "query": query, "response": response_text}
     except Exception as e:
         error_msg = str(e)[:100]
-        logger.error(f"Chat API执行异常 | 查询: {query[:50]} | 错误: {error_msg}", exc_info=True)
+        logger.error(
+            "Chat API执行异常 | session_id: %s | query: %s | 错误: %s",
+            mask_session_id(session_id),
+            summarize_text_for_log(query, preview_chars=24),
+            summarize_error_for_log(error_msg),
+            exc_info=True,
+        )
         return {
             "code": 500,
             "error_code": "CHAT_RUNTIME_ERROR",
@@ -1481,10 +1725,11 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
             },
         )
 
-    qdrant_url = os.getenv("QDRANT_URL", "").strip()
-    qdrant_api_key = os.getenv("QDRANT_API_KEY", "").strip() or None
-    qdrant_path = os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db")
-    collection_name = os.getenv("QDRANT_COLLECTION", "divination_master_collection")
+    qdrant_settings = get_qdrant_settings()
+    qdrant_url = qdrant_settings.url
+    qdrant_api_key = qdrant_settings.api_key or None
+    qdrant_path = qdrant_settings.path
+    collection_name = qdrant_settings.collection
     embedding_cfg = resolve_embedding_config()
     vector_size = embedding_cfg.dimensions
 
@@ -1759,7 +2004,7 @@ def recreate_qdrant(
     collection: Optional[str] = Query(default=None, description="可选：指定要重建的collection，默认使用QDRANT_COLLECTION"),
 ):
     """删除并重建Qdrant collection。"""
-    target = (collection or os.getenv("QDRANT_COLLECTION", "divination_master_collection")).strip()
+    target = (collection or get_qdrant_settings().collection).strip()
     try:
         result = recreate_qdrant_collection(collection_name=target)
         logger.info("Qdrant重建完成 | result: %s", result)
@@ -1828,6 +2073,25 @@ def qdrant_status():
 
 
 @app.get(
+    "/config/health",
+    summary="配置健康摘要",
+    description="返回启动期配置健康摘要，便于排障（不包含敏感值）。",
+)
+def config_health():
+    """读取配置健康摘要。"""
+    summary = build_config_health_summary()
+    return {
+        "code": 200,
+        "data": {
+            "ok": bool(summary.get("ok", False)),
+            "warnings": list(summary.get("warnings", ())),
+            "errors": list(summary.get("errors", ())),
+            "highlights": dict(summary.get("highlights", {})),
+        },
+    }
+
+
+@app.get(
     "/embedding/config",
     response_model=EmbeddingConfigResponse,
     summary="Embedding配置",
@@ -1836,12 +2100,13 @@ def qdrant_status():
 def embedding_config() -> EmbeddingConfigResponse:
     """读取当前生效 embedding 配置，用于排查维度不一致问题。"""
     cfg = resolve_embedding_config()
+    qdrant_settings = get_qdrant_settings()
     return EmbeddingConfigResponse(
         model=cfg.model,
         dimensions=cfg.dimensions,
         dimension_source=cfg.dimension_source,
-        collection=(os.getenv("QDRANT_COLLECTION", "divination_master_collection").strip() or "divination_master_collection"),
-        qdrant_distance=(os.getenv("QDRANT_DISTANCE", "cosine").strip().lower() or "cosine"),
+        collection=qdrant_settings.collection,
+        qdrant_distance=qdrant_settings.distance,
     )
 
 
@@ -1916,11 +2181,20 @@ def memory_status(session_id: str):
         )
     try:
         status = master.get_memory_status(session_id)
-        logger.info("memory状态查询成功 | session_id: %s | count: %s", status["session_id"], status["message_count"])
+        logger.info(
+            "memory状态查询成功 | session_id: %s | count: %s",
+            mask_session_id(status["session_id"]),
+            status["message_count"],
+        )
         return {"code": 200, "data": status}
     except Exception as e:
         err = str(e)[:120]
-        logger.error("memory状态查询失败 | session_id: %s | err: %s", session_id, err, exc_info=True)
+        logger.error(
+            "memory状态查询失败 | session_id: %s | err: %s",
+            mask_session_id(session_id),
+            summarize_error_for_log(err),
+            exc_info=True,
+        )
         return {
             "code": 500,
             "error_code": "MEMORY_STATUS_ERROR",
@@ -1936,6 +2210,12 @@ async def ws(websocket: WebSocket):
         await websocket.close(code=1008, reason="Not Found")
         return
 
+    try:
+        ensure_websocket_auth(gateway_security_settings, websocket)
+    except HTTPException:
+        await websocket.close(code=1008, reason="gateway auth failed")
+        return
+
     await websocket.accept()
     client_ip = websocket.client.host
     session_id = (websocket.query_params.get("session_id") or "").strip()
@@ -1943,8 +2223,16 @@ async def ws(websocket: WebSocket):
         logger.warning("WebSocket连接拒绝 | 客户端IP: %s | 原因: session_id不能为空", client_ip)
         await websocket.close(code=1008, reason="session_id不能为空")
         return
+
+    try:
+        ensure_ws_rate_limit(gateway_security_settings, websocket, gateway_rate_limiter, session_id=session_id)
+    except HTTPException:
+        await websocket.close(code=1008, reason="gateway rate limited")
+        return
+
     ws_start = time.perf_counter()
-    logger.info(f"WebSocket连接建立 | 客户端IP: {client_ip} | session_id: {session_id}")
+    session_hash = _safe_session_hash(session_id)
+    logger.info("WebSocket连接建立 | 客户端IP: %s | session_id: %s", client_ip, mask_session_id(session_id))
     log_event(
         logging.INFO,
         "ws.open",
@@ -1956,13 +2244,22 @@ async def ws(websocket: WebSocket):
         while True:
             data = await websocket.receive_text()
             msg_start = time.perf_counter()
-            logger.info(f"WebSocket接收消息 | 客户端IP: {client_ip} | session_id: {session_id} | 消息: {data[:100]}")
+            logger.info(
+                "WebSocket接收消息 | 客户端IP: %s | session_id: %s | input: %s",
+                client_ip,
+                mask_session_id(session_id),
+                summarize_text_for_log(data, preview_chars=24),
+            )
             
             res = await master.run_async(data, session_id=session_id)
             clean_response = res.get("output", USER_MESSAGES["ws_default"])
             
             await websocket.send_text(clean_response)
-            logger.info(f"WebSocket发送消息 | 客户端IP: {client_ip} | 响应长度: {len(clean_response)}")
+            logger.info(
+                "WebSocket发送消息 | 客户端IP: %s | response: %s",
+                client_ip,
+                summarize_text_for_log(clean_response, preview_chars=24),
+            )
             log_event(
                 logging.INFO,
                 "ws.message",
@@ -1974,7 +2271,7 @@ async def ws(websocket: WebSocket):
             )
             
     except WebSocketDisconnect:
-        logger.info(f"WebSocket连接断开 | 客户端IP: {client_ip}")
+        logger.info("WebSocket连接断开 | 客户端IP: %s | session_id: %s", client_ip, mask_session_id(session_id))
         log_event(
             logging.INFO,
             "ws.close",
@@ -1996,10 +2293,8 @@ async def ws(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    api_host = os.getenv("API_HOST", "127.0.0.1").strip() or "127.0.0.1"
-    try:
-        api_port = int(os.getenv("API_PORT", "8000"))
-    except ValueError:
-        api_port = 8000
+    server_settings = get_server_settings()
+    api_host = server_settings.host
+    api_port = server_settings.port
     logger.info("启动FastAPI服务 | 地址: %s:%s", api_host, api_port)
     uvicorn.run(app, host=api_host, port=api_port)

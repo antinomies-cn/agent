@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import threading
 import time
@@ -22,9 +21,15 @@ from app.tools.mytools import (
     vector_search,
     xingpan,
 )
-from app.core.config import IS_PROD, get_llm_gateway_settings
+from app.core.config import (
+    IS_PROD,
+    get_env_float,
+    get_env_int,
+    get_llm_gateway_settings,
+    get_redis_settings,
+)
 from app.llm.custom_llm import CustomProxyLLM, _thread_ctx
-from app.core.logger_setup import logger
+from app.core.logger_setup import logger, mask_session_id, summarize_error_for_log, summarize_text_for_log
 from app.core.texts import MOOD_CLASSIFY_PROMPT, MOODS, SYSTEMPL, USER_MESSAGES
 
 
@@ -40,17 +45,7 @@ class Master:
     @staticmethod
     def _build_redis_url_from_env() -> str:
         """构建Redis连接地址，优先兼容REDIS_*分项配置。"""
-        host = os.getenv("REDIS_HOST", "127.0.0.1").strip() or "127.0.0.1"
-        port = os.getenv("REDIS_PORT", "6379").strip() or "6379"
-        db = os.getenv("REDIS_DB", "0").strip() or "0"
-        password = os.getenv("REDIS_PASSWORD", "")
-
-        # URL中若无密码，格式为 redis://host:port/db。
-        if not password:
-            return f"redis://{host}:{port}/{db}"
-
-        # Redis URL规范：带密码时使用 redis://:password@host:port/db。
-        return f"redis://:{password}@{host}:{port}/{db}"
+        return get_redis_settings().url
 
     def __init__(self):
         llm_cfg = get_llm_gateway_settings()
@@ -80,10 +75,10 @@ class Master:
             astro_transit_chart,
         ]
 
-        self.redis_url = os.getenv("REDIS_URL", "").strip() or self._build_redis_url_from_env()
-        self.memory_ttl = int(os.getenv("MEMORY_TTL", "86400"))
-        self.memory_compact_message_count = int(os.getenv("MEMORY_COMPACT_MESSAGE_COUNT", "10"))
-        self.mood_timeout_seconds = float(os.getenv("MOOD_TIMEOUT_SECONDS", "5"))
+        self.redis_url = self._build_redis_url_from_env()
+        self.memory_ttl = get_env_int("MEMORY_TTL", default=86400, min_value=60)
+        self.memory_compact_message_count = get_env_int("MEMORY_COMPACT_MESSAGE_COUNT", default=10, min_value=1)
+        self.mood_timeout_seconds = get_env_float("MOOD_TIMEOUT_SECONDS", default=5.0, min_value=0.1)
         self._local_histories: dict[str, InMemoryChatMessageHistory] = {}
         self._local_histories_lock = threading.Lock()
         self._session_locks: dict[str, threading.Lock] = {}
@@ -235,14 +230,22 @@ class Master:
             _ = chat_history.messages
             return chat_history, "redis"
         except Exception as e:
-            logger.warning("Redis memory不可用，降级到进程内memory | session_id: %s | err: %s", sid, str(e)[:120])
+            logger.warning(
+                "Redis memory不可用，降级到进程内memory | session_id: %s | err: %s",
+                mask_session_id(sid),
+                summarize_error_for_log(str(e)),
+            )
             return self._get_or_create_local_history(sid), "in_memory"
 
     def _compact_history_if_needed(self, chat_history, session_id: str) -> None:
         try:
             messages = list(chat_history.messages)
         except Exception as e:
-            logger.warning("读取历史消息失败，跳过压缩 | session_id: %s | err: %s", session_id, str(e)[:120])
+            logger.warning(
+                "读取历史消息失败，跳过压缩 | session_id: %s | err: %s",
+                mask_session_id(session_id),
+                summarize_error_for_log(str(e)),
+            )
             return
 
         threshold = max(1, self.memory_compact_message_count)
@@ -280,7 +283,11 @@ class Master:
                 timeout=15,
             ).strip()
         except Exception as e:
-            logger.warning("历史压缩失败，回退截断摘要 | session_id: %s | err: %s", session_id, str(e)[:120])
+            logger.warning(
+                "历史压缩失败，回退截断摘要 | session_id: %s | err: %s",
+                mask_session_id(session_id),
+                summarize_error_for_log(str(e)),
+            )
 
         if not summary_text:
             summary_text = history_text[-1000:]
@@ -292,11 +299,16 @@ class Master:
             self._append_summary_message(chat_history, summary_text)
             logger.info(
                 "历史压缩完成 | session_id: %s | before_messages: %s | after_messages: 1",
-                session_id,
+                mask_session_id(session_id),
                 len(messages),
             )
         except Exception as e:
-            logger.error("写回压缩摘要失败 | session_id: %s | err: %s", session_id, str(e)[:120], exc_info=True)
+            logger.error(
+                "写回压缩摘要失败 | session_id: %s | err: %s",
+                mask_session_id(session_id),
+                summarize_error_for_log(str(e)),
+                exc_info=True,
+            )
 
     def _build_memory(self, session_id: str) -> ConversationBufferMemory:
         sid = self._normalize_session_id(session_id)
@@ -446,7 +458,12 @@ class Master:
         rule_hit = self._rule_based_mood(query)
         if rule_hit:
             elapsed = time.perf_counter() - start_time
-            logger.info("情绪识别完成 | 用户输入: %s | 识别结果: %s | 耗时: %.2f秒 | 来源: rule", query[:50], rule_hit, elapsed)
+            logger.info(
+                "情绪识别完成 | 用户输入: %s | 识别结果: %s | 耗时: %.2f秒 | 来源: rule",
+                summarize_text_for_log(query, preview_chars=24),
+                rule_hit,
+                elapsed,
+            )
             return rule_hit
 
         try:
@@ -454,14 +471,29 @@ class Master:
             r = self._invoke_with_timeout(lambda: chain.invoke({"query": query}), timeout).strip().lower()
             mood = r if r in MOODS else "default"
             elapsed = time.perf_counter() - start_time
-            logger.info("情绪识别完成 | 用户输入: %s | 识别结果: %s | 耗时: %.2f秒", query[:50], mood, elapsed)
+            logger.info(
+                "情绪识别完成 | 用户输入: %s | 识别结果: %s | 耗时: %.2f秒",
+                summarize_text_for_log(query, preview_chars=24),
+                mood,
+                elapsed,
+            )
             return mood
         except TimeoutError:
             elapsed = time.perf_counter() - start_time
-            logger.warning("情绪识别超时 | 用户输入: %s | 超时: %s秒 | 已耗时: %.2f秒", query[:50], timeout, elapsed)
+            logger.warning(
+                "情绪识别超时 | 用户输入: %s | 超时: %s秒 | 已耗时: %.2f秒",
+                summarize_text_for_log(query, preview_chars=24),
+                timeout,
+                elapsed,
+            )
             return "default"
         except Exception as e:
-            logger.error("情绪识别异常 | 用户输入: %s | 错误: %s", query[:50], str(e)[:100], exc_info=True)
+            logger.error(
+                "情绪识别异常 | 用户输入: %s | 错误: %s",
+                summarize_text_for_log(query, preview_chars=24),
+                summarize_error_for_log(str(e)),
+                exc_info=True,
+            )
             return "default"
 
     def _rule_based_mood(self, query: str) -> str | None:
@@ -499,7 +531,12 @@ class Master:
                     "xingpan",
                 }
                 effective_timeout = max(timeout, 90) if intent in astro_intents else timeout
-                logger.info("开始处理用户请求 | session_id: %s | 查询内容: %s | 超时时间: %s秒", sid, query[:100], effective_timeout)
+                logger.info(
+                    "开始处理用户请求 | session_id: %s | 查询内容: %s | 超时时间: %s秒",
+                    mask_session_id(sid),
+                    summarize_text_for_log(query, preview_chars=32),
+                    effective_timeout,
+                )
 
                 motion = self.mood_chain(query, timeout=self.mood_timeout_seconds)
 
@@ -528,7 +565,11 @@ class Master:
 
                 remain = effective_timeout - (time.time() - st)
                 if remain <= 0:
-                    logger.warning("请求处理超时 | 查询内容: %s | 已耗时: %.2f秒", query[:50], time.time() - st)
+                    logger.warning(
+                        "请求处理超时 | 查询内容: %s | 已耗时: %.2f秒",
+                        summarize_text_for_log(query, preview_chars=24),
+                        time.time() - st,
+                    )
                     return {"output": USER_MESSAGES["timeout_response"]}
 
                 agent_start = time.perf_counter()
@@ -546,8 +587,8 @@ class Master:
                                     "工具调用轨迹 | step: %s | tool: %s | input: %s | output: %s",
                                     i,
                                     tool_name,
-                                    tool_input,
-                                    obs_preview,
+                                    summarize_text_for_log(tool_input, preview_chars=24),
+                                    summarize_text_for_log(obs_preview, preview_chars=24),
                                 )
                             except Exception as trace_err:
                                 logger.warning("工具调用轨迹解析失败 | step: %s | error: %s", i, str(trace_err)[:100])
@@ -563,10 +604,15 @@ class Master:
                                 result["output"] = fallback_output
 
                     agent_elapsed = time.perf_counter() - agent_start
-                    logger.info("Agent调用完成 | 查询内容: %s | 耗时: %.2f秒", query[:50], agent_elapsed)
+                    logger.info("Agent调用完成 | 查询内容: %s | 耗时: %.2f秒", summarize_text_for_log(query, preview_chars=24), agent_elapsed)
                 except TimeoutError as e:
                     agent_elapsed = time.perf_counter() - agent_start
-                    logger.warning("Agent调用超时 | 查询内容: %s | 超时: %.2f秒 | 已耗时: %.2f秒", query[:50], remain, agent_elapsed)
+                    logger.warning(
+                        "Agent调用超时 | 查询内容: %s | 超时: %.2f秒 | 已耗时: %.2f秒",
+                        summarize_text_for_log(query, preview_chars=24),
+                        remain,
+                        agent_elapsed,
+                    )
                     partial = getattr(e, "partial_result", None)
                     if intent in astro_intents and isinstance(partial, dict):
                         steps = partial.get("intermediate_steps", [])
@@ -578,12 +624,23 @@ class Master:
                     raise
 
                 total_time = time.time() - st
-                logger.info("请求处理完成 | session_id: %s | 查询内容: %s | 耗时: %.2f秒", sid, query[:50], total_time)
+                logger.info(
+                    "请求处理完成 | session_id: %s | 查询内容: %s | 耗时: %.2f秒",
+                    mask_session_id(sid),
+                    summarize_text_for_log(query, preview_chars=24),
+                    total_time,
+                )
                 return result
 
         except Exception as e:
             error_msg = str(e)[:100]
-            logger.error("run方法执行异常 | session_id: %s | 查询内容: %s | 错误: %s", session_id, query[:50], error_msg, exc_info=True)
+            logger.error(
+                "run方法执行异常 | session_id: %s | 查询内容: %s | 错误: %s",
+                mask_session_id(session_id or ""),
+                summarize_text_for_log(query, preview_chars=24),
+                summarize_error_for_log(error_msg),
+                exc_info=True,
+            )
             return {"output": f"服务异常：{error_msg}"}
 
     async def run_async(self, query, timeout=60, session_id: str | None = None):
@@ -594,7 +651,13 @@ class Master:
             res = await loop.run_in_executor(None, self.run, query, timeout, session_id)
             return res
         except Exception as e:
-            logger.error("异步调用异常 | session_id: %s | 查询内容: %s | 错误: %s", session_id, query[:50], str(e)[:100], exc_info=True)
+            logger.error(
+                "异步调用异常 | session_id: %s | 查询内容: %s | 错误: %s",
+                mask_session_id(session_id or ""),
+                summarize_text_for_log(query, preview_chars=24),
+                summarize_error_for_log(str(e)),
+                exc_info=True,
+            )
             return {"output": "服务异常，请稍后再试"}
 
     @staticmethod

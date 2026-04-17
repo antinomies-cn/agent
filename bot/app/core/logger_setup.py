@@ -2,11 +2,72 @@ import json
 import os
 import logging
 import logging.handlers
+import hashlib
 import uuid
 from contextvars import ContextVar
+from app.core.config import get_env_int, get_env_str, is_prod_runtime
 
 
 _TRACE_ID_CTX: ContextVar[str] = ContextVar("trace_id", default="")
+
+
+def _is_prod_runtime() -> bool:
+    return is_prod_runtime()
+
+
+def _sha256_short(text: str) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest()[:12]
+
+
+def mask_session_id(session_id: str) -> str:
+    clean = (session_id or "").strip()
+    if not clean:
+        return ""
+    if _is_prod_runtime():
+        return f"sid:{_sha256_short(clean)}"
+    if len(clean) <= 8:
+        return clean
+    return f"{clean[:4]}…{clean[-4:]}"
+
+
+def summarize_text_for_log(text: str, preview_chars: int = 32) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+
+    length = len(clean)
+    digest = _sha256_short(clean)
+    preview = clean[: max(0, preview_chars)].replace("\r", " ").replace("\n", " ")
+    if _is_prod_runtime():
+        return f"len={length},sha256={digest}"
+    if len(clean) > preview_chars:
+        preview = f"{preview}…"
+    return f"len={length},sha256={digest},preview={preview}"
+
+
+def summarize_error_for_log(error: str, preview_chars: int = 80) -> str:
+    clean = (error or "").strip()
+    if not clean:
+        return ""
+    if _is_prod_runtime():
+        return f"len={len(clean)},sha256={_sha256_short(clean)}"
+    if len(clean) > preview_chars:
+        return f"{clean[:preview_chars]}…"
+    return clean
+
+
+def _sanitize_field(key: str, value):
+    lowered = (key or "").strip().lower()
+    if lowered in {"session_id", "session", "sid"}:
+        return mask_session_id(str(value))
+    if lowered in {"query", "input", "output", "response", "content", "message", "prompt", "tool_input", "preview"}:
+        return summarize_text_for_log(str(value))
+    if lowered in {"error", "err", "detail"}:
+        return summarize_error_for_log(str(value))
+    return value
 
 
 def setup_logger():
@@ -19,10 +80,10 @@ def setup_logger():
         "critical": logging.CRITICAL,
     }
 
-    log_level = os.getenv("LOG_LEVEL", "info").lower()
-    log_dir = os.getenv("LOG_DIR", "./logs")
-    log_max_size = int(os.getenv("LOG_MAX_SIZE", 10 * 1024 * 1024))
-    log_backup_count = int(os.getenv("LOG_BACKUP_COUNT", 5))
+    log_level = get_env_str("LOG_LEVEL", "info").lower() or "info"
+    log_dir = get_env_str("LOG_DIR", "./logs") or "./logs"
+    log_max_size = get_env_int("LOG_MAX_SIZE", default=10 * 1024 * 1024, min_value=1)
+    log_backup_count = get_env_int("LOG_BACKUP_COUNT", default=5, min_value=1)
 
     os.makedirs(log_dir, exist_ok=True)
 
@@ -59,7 +120,7 @@ def get_trace_id() -> str:
     if trace_id:
         return trace_id
 
-    fallback = os.getenv("TRACE_ID", "").strip()
+    fallback = get_env_str("TRACE_ID", "")
     if fallback:
         return fallback
     return ""
@@ -85,5 +146,5 @@ def log_event(level: int, event: str, **fields) -> None:
         payload["trace_id"] = trace_id
 
     for key, value in fields.items():
-        payload[key] = value
+        payload[key] = _sanitize_field(key, value)
     logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))

@@ -4,15 +4,33 @@ import logging
 from typing import Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
+from app.core.config import get_qdrant_settings
 from app.core.embedding_config import resolve_embedding_config
 from app.core.logger_setup import logger, log_event
 
 
+def _invalidate_vector_retriever_cache() -> bool:
+    """尽力失效进程内向量检索器缓存，返回是否检测到已有缓存。"""
+    try:
+        # 延迟导入，避免服务层与工具层形成模块初始化循环依赖。
+        from app.tools.mytools import reset_vector_retriever_cache
+    except Exception as e:
+        logger.warning("向量检索器缓存失效导入失败 | err: %s", str(e)[:160])
+        return False
+
+    try:
+        return bool(reset_vector_retriever_cache())
+    except Exception as e:
+        logger.warning("向量检索器缓存失效执行失败 | err: %s", str(e)[:160], exc_info=True)
+        return False
+
+
 def _get_qdrant_client() -> QdrantClient:
     """根据环境变量创建Qdrant客户端。"""
-    qdrant_url = os.getenv("QDRANT_URL", "").strip()
-    qdrant_api_key = os.getenv("QDRANT_API_KEY", "").strip() or None
-    qdrant_path = os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db")
+    settings = get_qdrant_settings()
+    qdrant_url = settings.url
+    qdrant_api_key = settings.api_key or None
+    qdrant_path = settings.path
 
     if qdrant_url:
         return QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
@@ -25,7 +43,7 @@ def _resolve_vector_size(default_value: int = 1024) -> int:
 
 
 def _resolve_distance() -> rest.Distance:
-    distance_name = os.getenv("QDRANT_DISTANCE", "Cosine").strip().lower()
+    distance_name = get_qdrant_settings().distance
     distance_map = {
         "cosine": rest.Distance.COSINE,
         "dot": rest.Distance.DOT,
@@ -37,7 +55,7 @@ def _resolve_distance() -> rest.Distance:
 def init_qdrant_collection(collection_name: Optional[str] = None, force_recreate: bool = False) -> dict:
     """初始化Qdrant collection；可按需删除旧集合并重建。"""
     start_time = time.perf_counter()
-    target_collection = (collection_name or os.getenv("QDRANT_COLLECTION", "divination_master_collection")).strip()
+    target_collection = (collection_name or get_qdrant_settings().collection).strip()
     if not target_collection:
         target_collection = "divination_master_collection"
 
@@ -61,6 +79,9 @@ def init_qdrant_collection(collection_name: Optional[str] = None, force_recreate
             deleted = True
             exists = False
 
+        retriever_cache_reset_attempted = False
+        retriever_cache_had_cache = False
+
         if exists:
             result = {
                 "ok": True,
@@ -69,12 +90,16 @@ def init_qdrant_collection(collection_name: Optional[str] = None, force_recreate
                 "collection": target_collection,
                 "vector_size": vector_size,
                 "distance": distance.name,
+                "retriever_cache_reset_attempted": False,
+                "retriever_cache_had_cache": False,
             }
         else:
             client.create_collection(
                 collection_name=target_collection,
                 vectors_config=rest.VectorParams(size=vector_size, distance=distance),
             )
+            retriever_cache_reset_attempted = True
+            retriever_cache_had_cache = _invalidate_vector_retriever_cache()
             result = {
                 "ok": True,
                 "created": True,
@@ -82,6 +107,8 @@ def init_qdrant_collection(collection_name: Optional[str] = None, force_recreate
                 "collection": target_collection,
                 "vector_size": vector_size,
                 "distance": distance.name,
+                "retriever_cache_reset_attempted": retriever_cache_reset_attempted,
+                "retriever_cache_had_cache": retriever_cache_had_cache,
             }
 
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
@@ -93,6 +120,8 @@ def init_qdrant_collection(collection_name: Optional[str] = None, force_recreate
             deleted=result["deleted"],
             vector_size=vector_size,
             distance=distance.name,
+            retriever_cache_reset_attempted=result["retriever_cache_reset_attempted"],
+            retriever_cache_had_cache=result["retriever_cache_had_cache"],
             elapsed_ms=elapsed_ms,
         )
         return result
@@ -154,8 +183,9 @@ def qdrant_list_collections() -> dict:
 def qdrant_repo_status() -> dict:
     """简单监视Qdrant仓库状态，不改变任何配置。"""
     start_time = time.perf_counter()
-    qdrant_url = os.getenv("QDRANT_URL", "").strip()
-    qdrant_path = os.getenv("QDRANT_DB_PATH", "./qdrant_data/qdrant.db")
+    qdrant_settings = get_qdrant_settings()
+    qdrant_url = qdrant_settings.url
+    qdrant_path = qdrant_settings.path
     mode = "remote" if qdrant_url else "local"
 
     client = _get_qdrant_client()

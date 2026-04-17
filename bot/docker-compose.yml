@@ -26,12 +26,12 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import os, urllib.request; k = os.environ.get('LITELLM_MASTER_KEY', ''); req = urllib.request.Request('http://localhost:4000/health', headers={'Authorization': 'Bearer ' + k} if k else {}); r = urllib.request.urlopen(req, timeout=3); raise SystemExit(0 if r.status == 200 else 1)\"",
+          "python -c \"import socket; s=socket.socket(); s.settimeout(3); ok=(s.connect_ex(('127.0.0.1', 4000))==0); s.close(); raise SystemExit(0 if ok else 1)\"",
         ]
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 10s 
+      start_period: 30s 
     env_file: .env
 
   app:
@@ -70,6 +70,19 @@ services:
       MEMORY_TTL: "86400"
       MEMORY_COMPACT_MESSAGE_COUNT: "10"
       MOOD_TIMEOUT_SECONDS: "5"
+      GATEWAY_AUTH_ENABLED: "${GATEWAY_AUTH_ENABLED:-false}"
+      GATEWAY_AUTH_TOKENS: "${GATEWAY_AUTH_TOKENS:-}"
+      GATEWAY_RATE_LIMIT_ENABLED: "${GATEWAY_RATE_LIMIT_ENABLED:-false}"
+      GATEWAY_RATE_LIMIT_IP_REQUESTS: "${GATEWAY_RATE_LIMIT_IP_REQUESTS:-60}"
+      GATEWAY_RATE_LIMIT_SESSION_REQUESTS: "${GATEWAY_RATE_LIMIT_SESSION_REQUESTS:-30}"
+      GATEWAY_RATE_LIMIT_WINDOW_SECONDS: "${GATEWAY_RATE_LIMIT_WINDOW_SECONDS:-60}"
+      GATEWAY_MAX_REQUEST_BODY: "${GATEWAY_MAX_REQUEST_BODY:-2097152}"
+      GATEWAY_REQUEST_TIMEOUT_SECONDS: "${GATEWAY_REQUEST_TIMEOUT_SECONDS:-0}"
+      GATEWAY_CORS_ALLOW_ORIGINS: "${GATEWAY_CORS_ALLOW_ORIGINS:-*}"
+      GATEWAY_CORS_ALLOW_METHODS: "${GATEWAY_CORS_ALLOW_METHODS:-*}"
+      GATEWAY_CORS_ALLOW_HEADERS: "${GATEWAY_CORS_ALLOW_HEADERS:-*}"
+      GATEWAY_CORS_ALLOW_CREDENTIALS: "${GATEWAY_CORS_ALLOW_CREDENTIALS:-false}"
+      GATEWAY_TRUST_PROXY_HEADERS: "${GATEWAY_TRUST_PROXY_HEADERS:-true}"
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
       OPENAI_API_BASE: "${OPENAI_API_BASE:-http://litellm:4000}"
       OPENAI_MODEL: "${OPENAI_MODEL:-MiniMax-M2.5}"
@@ -82,7 +95,7 @@ services:
       RERANK_ENABLED: "${RERANK_ENABLED:-true}"
       RERANK_MODEL: "${RERANK_MODEL:-bge-reranker}"
       RERANK_UPSTREAM_MODEL: "${RERANK_UPSTREAM_MODEL:-bge-reranker-v2-m3}"
-      RERANK_DIRECT_UPSTREAM: "${RERANK_DIRECT_UPSTREAM:-true}"
+      RERANK_DIRECT_UPSTREAM: "${RERANK_DIRECT_UPSTREAM:-false}"
       RERANK_TIMEOUT: "${RERANK_TIMEOUT:-15}"
       RERANK_RETRY_COUNT: "${RERANK_RETRY_COUNT:-1}"
       RERANK_TOP_N: "${RERANK_TOP_N:-}"
@@ -95,6 +108,10 @@ services:
       ASTRO_UID: "${ASTRO_UID:-}"
       WEB_LOADER_VERIFY_SSL: "${WEB_LOADER_VERIFY_SSL:-true}"
       ADD_URLS_WRITE_ENABLED: "${ADD_URLS_WRITE_ENABLED:-false}"
+      ADD_URLS_FETCH_TIMEOUT_SECONDS: "${ADD_URLS_FETCH_TIMEOUT_SECONDS:-10}"
+      ADD_URLS_FETCH_RETRY_COUNT: "${ADD_URLS_FETCH_RETRY_COUNT:-2}"
+      ADD_URLS_FETCH_BACKOFF_SECONDS: "${ADD_URLS_FETCH_BACKOFF_SECONDS:-1}"
+      ADD_URLS_MAX_CONTENT_CHARS: "${ADD_URLS_MAX_CONTENT_CHARS:-20000}"
     depends_on:
       litellm:
         condition: service_healthy

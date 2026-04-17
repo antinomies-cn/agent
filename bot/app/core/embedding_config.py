@@ -1,6 +1,7 @@
-import os
 from dataclasses import dataclass
 from typing import Optional
+
+from app.core import config as _app_config
 
 DEFAULT_EMBEDDINGS_DIMENSION = 1024
 
@@ -36,7 +37,7 @@ def _sanitize_model_name(raw_model: str) -> str:
 
 
 def _resolve_dimension_from_env() -> Optional[int]:
-    raw = os.getenv("EMBEDDINGS_DIMENSION", "").strip()
+    raw = _app_config.get_env_str("EMBEDDINGS_DIMENSION", "")
     if not raw:
         return None
 
@@ -55,7 +56,7 @@ def _resolve_dimension_by_model(model_name: str) -> Optional[int]:
 
 
 def resolve_embedding_config(default_dimension: Optional[int] = None, model_name: Optional[str] = None) -> EmbeddingConfig:
-    resolved_model = _sanitize_model_name(model_name or os.getenv("EMBEDDINGS_MODEL", "bge-m3"))
+    resolved_model = _sanitize_model_name(model_name or _app_config.get_env_str("EMBEDDINGS_MODEL", "bge-m3"))
 
     env_dim = _resolve_dimension_from_env()
     if env_dim is not None:

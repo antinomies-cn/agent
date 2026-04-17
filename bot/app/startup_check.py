@@ -16,6 +16,9 @@ if _BASE_DIR not in sys.path:
 from app.core.embedding_config import resolve_embedding_config
 from app.core.logger_setup import logger, log_event
 from app.core.config import (
+    build_config_health_summary,
+    get_env_bool,
+    get_env_str,
     get_embeddings_gateway_settings,
     get_rerank_gateway_settings,
 )
@@ -36,12 +39,6 @@ def _load_env_files() -> None:
         load_dotenv(dotenv_path=env_example_file, override=False)
 
 
-def _is_true(value: str, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _warn(message: str) -> None:
     logger.warning("startup-check warn: %s", message)
     log_event(logging.WARNING, "startup_check.warn", message=message)
@@ -56,7 +53,17 @@ def _fail(message: str) -> int:
 def main() -> int:
     _load_env_files()
 
-    enabled = _is_true(os.getenv("EMBEDDINGS_STARTUP_CHECK", "true"), default=True)
+    summary = build_config_health_summary()
+    log_event(
+        logging.INFO if summary.get("ok", False) else logging.ERROR,
+        "config.health.summary",
+        ok=bool(summary.get("ok", False)),
+        warnings=list(summary.get("warnings", ())),
+        errors=list(summary.get("errors", ())),
+        **dict(summary.get("highlights", {})),
+    )
+
+    enabled = get_env_bool("EMBEDDINGS_STARTUP_CHECK", default=True)
     if not enabled:
         logger.info("startup-check skip: EMBEDDINGS_STARTUP_CHECK=false")
         log_event(logging.INFO, "startup_check.skip", reason="EMBEDDINGS_STARTUP_CHECK=false")
@@ -79,7 +86,7 @@ def main() -> int:
     }
 
     expected_dim = None
-    expected_dim_text = os.getenv("EMBEDDINGS_DIMENSION", "").strip()
+    expected_dim_text = get_env_str("EMBEDDINGS_DIMENSION", "")
     if expected_dim_text:
         try:
             parsed = int(expected_dim_text)
