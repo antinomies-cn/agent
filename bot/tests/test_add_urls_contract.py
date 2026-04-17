@@ -681,6 +681,27 @@ def test_rerank_config_endpoint_returns_direct_upstream_state(monkeypatch):
     assert body["startup_strict"] is False
 
 
+def test_gateway_resilience_status_endpoint_returns_snapshot():
+    client = TestClient(main.app)
+    resp = client.get("/gateway/resilience/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list)
+    assert body == [] or all(
+        {
+            "component",
+            "enabled",
+            "state",
+            "failure_count",
+            "failure_threshold",
+            "open_seconds",
+            "retry_after_seconds",
+        }.issubset(item.keys())
+        for item in body
+    )
+
+
 def test_config_health_endpoint_returns_summary(monkeypatch):
     monkeypatch.setenv("ENV", "dev")
     monkeypatch.setenv("API_HOST", "127.0.0.1")

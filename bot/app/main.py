@@ -7,6 +7,7 @@ import logging
 import hashlib
 import socket
 import ipaddress
+import uuid
 from enum import Enum
 import requests
 from urllib.parse import urlparse
@@ -50,7 +51,18 @@ from app.core.gateway_security import (
     ensure_ws_rate_limit,
     log_http_gateway_audit,
 )
-from app.core.logger_setup import logger, log_event, mask_session_id, summarize_text_for_log, summarize_error_for_log
+from app.core.gateway_resilience import CircuitOpenError, resilience_execute
+from app.core.gateway_resilience import CircuitOpenError, get_resilience_snapshot, resilience_execute
+from app.core.logger_setup import (
+    clear_trace_id,
+    get_trace_id,
+    logger,
+    log_event,
+    mask_session_id,
+    set_trace_id,
+    summarize_error_for_log,
+    summarize_text_for_log,
+)
 from app.core.litellm_adapters import build_litellm_embeddings_client
 from app.services.master_service import Master
 from app.tools.mytools import (
@@ -149,6 +161,38 @@ _COMMON_ERROR_EXPLANATIONS = {
 }
 
 
+def _resolve_request_id(request: Request) -> str:
+    existing = getattr(request.state, "request_id", "")
+    if existing:
+        return existing
+
+    incoming = (request.headers.get("x-request-id") or "").strip()
+    request_id = incoming or uuid.uuid4().hex[:16]
+    request.state.request_id = request_id
+    return request_id
+
+
+def _resolve_trace_id(request: Request) -> str:
+    existing = getattr(request.state, "trace_id", "")
+    if existing:
+        return existing
+
+    incoming = (request.headers.get("x-trace-id") or "").strip()
+    if not incoming:
+        incoming = (request.headers.get("x-request-id") or "").strip()
+    trace_id = set_trace_id(incoming)
+    request.state.trace_id = trace_id
+    return trace_id
+
+
+def _attach_trace_headers(response: JSONResponse, request_id: str, trace_id: str) -> JSONResponse:
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
+    if trace_id:
+        response.headers["X-Trace-Id"] = trace_id
+    return response
+
+
 def _safe_session_hash(session_id: str) -> str:
     text = (session_id or "").strip()
     if not text:
@@ -182,17 +226,38 @@ _GATEWAY_EXEMPT_PATHS = {
 
 @app.middleware("http")
 async def _gateway_guard(request: Request, call_next):
+    request_id = _resolve_request_id(request)
+    trace_id = _resolve_trace_id(request)
+
     # CORS preflight must pass through auth/rate-limit checks.
     if request.method.upper() == "OPTIONS":
-        return await call_next(request)
+        response = await call_next(request)
+        if request_id:
+            response.headers["X-Request-Id"] = request_id
+        if trace_id:
+            response.headers["X-Trace-Id"] = trace_id
+        clear_trace_id()
+        return response
 
     path = request.url.path
     if path in _GATEWAY_EXEMPT_PATHS:
-        return await call_next(request)
+        response = await call_next(request)
+        if request_id:
+            response.headers["X-Request-Id"] = request_id
+        if trace_id:
+            response.headers["X-Trace-Id"] = trace_id
+        clear_trace_id()
+        return response
 
     # Keep existing prod 404 behavior for non-exposed routes.
     if _is_prod_runtime() and path not in _PROD_ALLOWED_HTTP_PATHS:
-        return await call_next(request)
+        response = await call_next(request)
+        if request_id:
+            response.headers["X-Request-Id"] = request_id
+        if trace_id:
+            response.headers["X-Trace-Id"] = trace_id
+        clear_trace_id()
+        return response
 
     start = time.perf_counter()
     auth_scheme = "none"
@@ -208,6 +273,7 @@ async def _gateway_guard(request: Request, call_next):
             trust_proxy_headers=gateway_security_settings.trust_proxy_headers,
         )
         request.state.request_id = audit_ctx.request_id
+        request.state.trace_id = trace_id
 
         timeout_seconds = gateway_security_settings.request_timeout_seconds
         if timeout_seconds and timeout_seconds > 0:
@@ -216,6 +282,8 @@ async def _gateway_guard(request: Request, call_next):
             response = await call_next(request)
         if audit_ctx is not None:
             response.headers["X-Request-Id"] = audit_ctx.request_id
+            if trace_id:
+                response.headers["X-Trace-Id"] = trace_id
             log_http_gateway_audit(
                 logging.INFO,
                 "gateway.request",
@@ -260,6 +328,8 @@ async def _gateway_guard(request: Request, call_next):
                 "error_code": "GATEWAY_TIMEOUT",
             },
         )
+    finally:
+        clear_trace_id()
 
 
 def _resolve_explanation_by_error_code(error_code: str) -> str:
@@ -299,10 +369,59 @@ def _normalize_http_exception_payload(status_code: int, detail: Any) -> Dict[str
     }
 
 
+def _build_error_response_payload(request: Request, status_code: int, normalized_payload: Dict[str, Any]) -> Dict[str, Any]:
+    error_code = str(normalized_payload.get("error_code") or f"HTTP_{status_code}")
+    explanation = normalized_payload.get("explanation") or _resolve_explanation_by_error_code(error_code)
+    request_id = getattr(request.state, "request_id", "")
+    trace_id = getattr(request.state, "trace_id", "") or get_trace_id()
+
+    detail = normalized_payload.get("detail", "请求处理失败")
+    message = None
+    if isinstance(detail, dict):
+        message = detail.get("message") or detail.get("detail")
+    if not message:
+        message = str(detail)
+
+    response_payload: Dict[str, Any] = {
+        "ok": False,
+        "code": error_code,
+        "message": message,
+        "data": None,
+        "error": {
+            "status_code": status_code,
+            "error_code": error_code,
+            "explanation": explanation,
+            "detail": detail,
+        },
+        # 兼容历史字段
+        "detail": detail,
+        "error_code": error_code,
+        "explanation": explanation,
+    }
+
+    errors = normalized_payload.get("errors")
+    if errors is not None:
+        response_payload["errors"] = errors
+        response_payload["error"]["errors"] = errors
+
+    if request_id:
+        response_payload["request_id"] = request_id
+    if trace_id:
+        response_payload["trace_id"] = trace_id
+
+    return response_payload
+
+
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(request: Request, exc: HTTPException):
     payload = _normalize_http_exception_payload(exc.status_code, exc.detail)
-    return JSONResponse(status_code=exc.status_code, content=payload)
+    response_payload = _build_error_response_payload(request, exc.status_code, payload)
+    response = JSONResponse(status_code=exc.status_code, content=response_payload)
+    return _attach_trace_headers(
+        response,
+        request_id=getattr(request.state, "request_id", ""),
+        trace_id=getattr(request.state, "trace_id", "") or get_trace_id(),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -313,7 +432,13 @@ async def _request_validation_exception_handler(request: Request, exc: RequestVa
         "explanation": _resolve_explanation_by_error_code("REQUEST_VALIDATION_ERROR"),
         "errors": exc.errors(),
     }
-    return JSONResponse(status_code=422, content=payload)
+    response_payload = _build_error_response_payload(request, 422, payload)
+    response = JSONResponse(status_code=422, content=response_payload)
+    return _attach_trace_headers(
+        response,
+        request_id=getattr(request.state, "request_id", ""),
+        trace_id=getattr(request.state, "trace_id", "") or get_trace_id(),
+    )
 
 
 @app.exception_handler(Exception)
@@ -324,7 +449,13 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
         "error_code": "INTERNAL_SERVER_ERROR",
         "explanation": _resolve_explanation_by_error_code("INTERNAL_SERVER_ERROR"),
     }
-    return JSONResponse(status_code=500, content=payload)
+    response_payload = _build_error_response_payload(request, 500, payload)
+    response = JSONResponse(status_code=500, content=response_payload)
+    return _attach_trace_headers(
+        response,
+        request_id=getattr(request.state, "request_id", ""),
+        trace_id=getattr(request.state, "trace_id", "") or get_trace_id(),
+    )
 
 
 class AddUrlsErrorCode(str, Enum):
@@ -461,6 +592,14 @@ class RerankConfigResponse(BaseModel):
     timeout_seconds: float = Field(description="rerank 超时秒数")
     top_n: Optional[int] = Field(default=None, description="rerank 返回的最大结果数，未设置则为 null")
     startup_strict: bool = Field(description="rerank 启动探针是否严格失败")
+class CircuitBreakerStatusItem(BaseModel):
+    component: str = Field(description="熔断器组件名")
+    enabled: bool = Field(description="是否启用熔断")
+    state: Literal["closed", "open", "half_open"] = Field(description="当前状态")
+    failure_count: int = Field(description="当前失败次数")
+    failure_threshold: int = Field(description="触发熔断的失败阈值")
+    open_seconds: float = Field(description="熔断开启持续时间")
+    retry_after_seconds: float = Field(description="距离可重试的剩余秒数")
 
 
 class ToolTestRequest(BaseModel):
@@ -1757,10 +1896,14 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
 
         try:
             ensure_start = time.perf_counter()
-            _ensure_qdrant_collection(
-                client=client,
-                collection_name=collection_name,
-                vector_size=effective_vector_size,
+            resilience_execute(
+                component="qdrant",
+                operation="ensure_collection",
+                func=lambda: _ensure_qdrant_collection(
+                    client=client,
+                    collection_name=collection_name,
+                    vector_size=effective_vector_size,
+                ),
             )
             log_event(
                 logging.INFO,
@@ -1788,7 +1931,11 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
         )
         try:
             write_start = time.perf_counter()
-            vector_store.add_documents(all_chunks)
+            resilience_execute(
+                component="qdrant",
+                operation="add_documents",
+                func=lambda: vector_store.add_documents(all_chunks),
+            )
             log_event(
                 logging.INFO,
                 "add_urls.qdrant.write",
@@ -1806,6 +1953,15 @@ def add_urls(payload: AddUrlsRequest = Depends(_resolve_add_urls_payload)) -> Ad
                         "collection": collection_name,
                         "expected_size": effective_vector_size,
                         "hint": "请调整 EMBEDDINGS_DIMENSION 与集合一致，或调用 /qdrant/recreate 重建集合。",
+                    },
+                )
+            if isinstance(write_err, CircuitOpenError):
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "message": "Qdrant 熔断保护中，请稍后重试",
+                        "error_code": "QDRANT_CIRCUIT_OPEN",
+                        "retry_after_seconds": write_err.retry_after_seconds,
                     },
                 )
             raise
@@ -2130,6 +2286,17 @@ def rerank_config() -> RerankConfigResponse:
         top_n=cfg.top_n,
         startup_strict=cfg.startup_strict,
     )
+
+
+@app.get(
+    "/gateway/resilience/status",
+    response_model=List[CircuitBreakerStatusItem],
+    summary="网关熔断状态",
+    description="返回当前 LLM / Qdrant / 外部 API 熔断器的只读状态，便于排障。",
+)
+def gateway_resilience_status() -> List[CircuitBreakerStatusItem]:
+    """读取当前网关熔断器状态快照。"""
+    return [CircuitBreakerStatusItem(**item) for item in get_resilience_snapshot()]
 
 @app.get("/health", summary="服务健康检查", description="检查服务与LLM连通性，返回运行状态。")
 async def health_check():

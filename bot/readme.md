@@ -485,8 +485,9 @@ flowchart TD
 
 规则：
 
-1. 环境变量只写网关根路径，例如 https://api.edgefn.net。
-2. 代码会自动拼接 /v1/chat/completions（LLM）与 /v1（Embeddings）。
+1. OPENAI_API_BASE 只写 LiteLLM 网关根路径，例如 http://litellm:4000（不要写上游 api.edgefn.net）。
+2. 上游地址通过 MIN_API_BASE/DEEP_API_BASE/GLM_API_BASE/BGE_API_BASE/RERANK_API_BASE 配置，当前建议写到 /v1（例如 https://api.edgefn.net/v1）。
+3. 代码会在网关路径上自动拼接 /v1/chat/completions（LLM）与 /v1/embeddings（Embeddings）；rerank 会按配置在 /rerank 与 /v1/rerank 间兜底。
 
 ### B.4 Redis 不可用导致记忆失效
 

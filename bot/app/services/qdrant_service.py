@@ -6,6 +6,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 from app.core.config import get_qdrant_settings
 from app.core.embedding_config import resolve_embedding_config
+from app.core.gateway_resilience import CircuitOpenError, resilience_execute
 from app.core.logger_setup import logger, log_event
 
 
@@ -37,6 +38,13 @@ def _get_qdrant_client() -> QdrantClient:
     return QdrantClient(path=qdrant_path)
 
 
+def _qdrant_execute(operation: str, func):
+    try:
+        return resilience_execute(component="qdrant", operation=operation, func=func)
+    except CircuitOpenError as e:
+        raise RuntimeError(f"Qdrant 熔断中，请稍后重试（retry_after={e.retry_after_seconds:.1f}s）") from e
+
+
 def _resolve_vector_size(default_value: int = 1024) -> int:
     """建库维度统一走 EmbeddingConfig 策略。"""
     return resolve_embedding_config(default_dimension=default_value).dimensions
@@ -65,17 +73,17 @@ def init_qdrant_collection(collection_name: Optional[str] = None, force_recreate
 
     try:
         try:
-            exists = client.collection_exists(target_collection)
+            exists = _qdrant_execute("collection_exists", lambda: client.collection_exists(target_collection))
         except Exception:
-            info = client.get_collections()
+            info = _qdrant_execute("get_collections", lambda: client.get_collections())
             exists = target_collection in [c.name for c in getattr(info, "collections", []) or []]
 
         deleted = False
         if exists and force_recreate:
             try:
-                client.delete_collection(collection_name=target_collection)
+                _qdrant_execute("delete_collection", lambda: client.delete_collection(collection_name=target_collection))
             except TypeError:
-                client.delete_collection(target_collection)
+                _qdrant_execute("delete_collection", lambda: client.delete_collection(target_collection))
             deleted = True
             exists = False
 
@@ -94,9 +102,12 @@ def init_qdrant_collection(collection_name: Optional[str] = None, force_recreate
                 "retriever_cache_had_cache": False,
             }
         else:
-            client.create_collection(
-                collection_name=target_collection,
-                vectors_config=rest.VectorParams(size=vector_size, distance=distance),
+            _qdrant_execute(
+                "create_collection",
+                lambda: client.create_collection(
+                    collection_name=target_collection,
+                    vectors_config=rest.VectorParams(size=vector_size, distance=distance),
+                ),
             )
             retriever_cache_reset_attempted = True
             retriever_cache_had_cache = _invalidate_vector_retriever_cache()
@@ -149,7 +160,7 @@ def qdrant_health() -> dict:
     """检查Qdrant连通性。"""
     start_time = time.perf_counter()
     client = _get_qdrant_client()
-    info = client.get_collections()
+    info = _qdrant_execute("get_collections", lambda: client.get_collections())
     result = {
         "ok": True,
         "collections_count": len(getattr(info, "collections", []) or []),
@@ -168,7 +179,7 @@ def qdrant_list_collections() -> dict:
     """列出Qdrant现有collections。"""
     start_time = time.perf_counter()
     client = _get_qdrant_client()
-    info = client.get_collections()
+    info = _qdrant_execute("get_collections", lambda: client.get_collections())
     collections = [c.name for c in getattr(info, "collections", []) or []]
     elapsed_ms = int((time.perf_counter() - start_time) * 1000)
     log_event(
@@ -189,7 +200,7 @@ def qdrant_repo_status() -> dict:
     mode = "remote" if qdrant_url else "local"
 
     client = _get_qdrant_client()
-    info = client.get_collections()
+    info = _qdrant_execute("get_collections", lambda: client.get_collections())
     collections = [c.name for c in getattr(info, "collections", []) or []]
 
     status = {

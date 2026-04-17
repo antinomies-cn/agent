@@ -8,6 +8,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 from app.core.config import IS_PROD, get_llm_gateway_settings, normalize_openai_base_url
 from app.core.gateway_http import post_json_with_retry
+from app.core.gateway_resilience import CircuitOpenError, resilience_execute
 from app.core.logger_setup import logger, log_event
 from app.core.texts import USER_MESSAGES
 
@@ -200,14 +201,19 @@ class CustomProxyLLM(BaseChatModel):
             timeout_seconds = self._resolve_timeout_seconds()
 
             max_retries = llm_cfg.retry_count
-            resp = post_json_with_retry(
-                url=url,
-                headers=headers,
-                body=data,
-                timeout_seconds=timeout_seconds,
-                retry_count=max_retries,
+            resp = resilience_execute(
                 component="llm",
                 operation="chat_completion",
+                func=lambda: post_json_with_retry(
+                    url=url,
+                    headers=headers,
+                    body=data,
+                    timeout_seconds=timeout_seconds,
+                    retry_count=max_retries,
+                    component="llm",
+                    operation="chat_completion",
+                ),
+                fallback=lambda err: (_ for _ in ()).throw(err),
             )
 
             if not IS_PROD:
@@ -279,6 +285,18 @@ class CustomProxyLLM(BaseChatModel):
                 elapsed_ms=int((time.perf_counter() - call_start) * 1000),
             )
             return USER_MESSAGES["timeout"], []
+
+        except CircuitOpenError as e:
+            logger.warning("LLM熔断开启 | component=%s | operation=%s", e.component, e.operation)
+            log_event(
+                logging.WARNING,
+                "llm.circuit_open",
+                component=e.component,
+                operation=e.operation,
+                retry_after_seconds=e.retry_after_seconds,
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
+            return "上游LLM暂时不可用，已触发熔断保护，请稍后重试。", []
 
         except requests.exceptions.ConnectionError:
             error_info = {"type": "CONNECTION_ERROR", "url": url if "url" in locals() else ""}

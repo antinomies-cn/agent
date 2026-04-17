@@ -12,6 +12,7 @@ from langchain_community.vectorstores import Qdrant
 from qdrant_client import QdrantClient
 from app.core import config as _app_config
 from app.core.embedding_config import resolve_embedding_config
+from app.core.gateway_resilience import CircuitOpenError, resilience_execute
 from app.core.logger_setup import log_event
 from app.core.litellm_adapters import build_litellm_embeddings_client, rerank_texts_with_litellm
 
@@ -154,9 +155,17 @@ def _request_astro_api(path: str, method: str = "POST", payload: dict | None = N
     try:
         m = (method or "POST").upper()
         if m == "GET":
-            resp = requests.get(api_url, headers=headers, timeout=max(1.0, timeout_seconds))
+            resp = resilience_execute(
+                component="external_api",
+                operation="astro_get",
+                func=lambda: requests.get(api_url, headers=headers, timeout=max(1.0, timeout_seconds)),
+            )
         else:
-            resp = requests.post(api_url, headers=headers, json=req_body, timeout=max(1.0, timeout_seconds))
+            resp = resilience_execute(
+                component="external_api",
+                operation="astro_post",
+                func=lambda: requests.post(api_url, headers=headers, json=req_body, timeout=max(1.0, timeout_seconds)),
+            )
         resp.raise_for_status()
 
         data = resp.json()
@@ -180,6 +189,18 @@ def _request_astro_api(path: str, method: str = "POST", payload: dict | None = N
             elapsed_ms=int((time.perf_counter() - start_time) * 1000),
         )
         return _tool_result(ok=False, code="TIMEOUT", error="星盘服务响应超时，请稍后再试。")
+    except CircuitOpenError as e:
+        logger.warning("星盘接口熔断开启 | path: %s | operation: %s", path, e.operation)
+        log_event(
+            logging.WARNING,
+            "astro.request.circuit_open",
+            method=method,
+            path=path,
+            operation=e.operation,
+            retry_after_seconds=e.retry_after_seconds,
+            elapsed_ms=int((time.perf_counter() - start_time) * 1000),
+        )
+        return _tool_result(ok=False, code="CIRCUIT_OPEN", error="星盘服务暂时不可用（熔断保护中），请稍后再试。")
     except requests.exceptions.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else 0
         body = ""
@@ -263,10 +284,18 @@ def _get_vector_retriever():
 
         init_start = time.perf_counter()
         if qdrant_url:
-            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
+            client = resilience_execute(
+                component="qdrant",
+                operation="build_client_remote",
+                func=lambda: QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None),
+            )
             mode = "remote"
         else:
-            client = QdrantClient(path=db_path)
+            client = resilience_execute(
+                component="qdrant",
+                operation="build_client_local",
+                func=lambda: QdrantClient(path=db_path),
+            )
             mode = "local"
 
         vector_store = Qdrant(
@@ -424,7 +453,11 @@ def search(query: str) -> str:
     try:
         start_time = time.perf_counter()
         serp = SerpAPIWrapper()
-        result = serp.run(clean_query)
+        result = resilience_execute(
+            component="external_api",
+            operation="serpapi_search",
+            func=lambda: serp.run(clean_query),
+        )
         logger.info(
             "执行搜索工具 | 查询: %s | 结果: %s",
             summarize_text_for_log(clean_query, preview_chars=24),
@@ -437,6 +470,16 @@ def search(query: str) -> str:
             elapsed_ms=int((time.perf_counter() - start_time) * 1000),
         )
         return result
+    except CircuitOpenError as e:
+        logger.warning("搜索工具熔断开启 | operation: %s", e.operation)
+        log_event(
+            logging.WARNING,
+            "tool.search.circuit_open",
+            query_len=len(clean_query),
+            operation=e.operation,
+            retry_after_seconds=e.retry_after_seconds,
+        )
+        return "搜索服务暂时不可用（熔断保护中），请稍后重试。"
     except Exception as e:
         logger.error(
             "搜索工具异常 | 查询: %s | 错误: %s",
@@ -462,7 +505,11 @@ def vector_search(query: str) -> str:
     try:
         start_time = time.perf_counter()
         retriever = _get_vector_retriever()
-        docs = retriever.invoke(clean_query)
+        docs = resilience_execute(
+            component="qdrant",
+            operation="vector_retrieval",
+            func=lambda: retriever.invoke(clean_query),
+        )
         docs = _rerank_documents_if_enabled(clean_query, docs)
         result = "\n\n".join(
             [doc.page_content for doc in docs if getattr(doc, "page_content", "")]
@@ -492,6 +539,16 @@ def vector_search(query: str) -> str:
             elapsed_ms=int((time.perf_counter() - start_time) * 1000),
         )
         return result
+    except CircuitOpenError as e:
+        logger.warning("向量检索熔断开启 | operation: %s", e.operation)
+        log_event(
+            logging.WARNING,
+            "tool.vector_search.circuit_open",
+            query_len=len(clean_query),
+            operation=e.operation,
+            retry_after_seconds=e.retry_after_seconds,
+        )
+        return "向量检索暂时不可用（熔断保护中），请稍后重试。"
     except Exception as e:
         logger.error(
             "向量搜索工具异常 | 查询: %s | 错误: %s",

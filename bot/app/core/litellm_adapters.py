@@ -9,6 +9,7 @@ from app.core.config import (
     normalize_openai_base_url,
 )
 from app.core.gateway_http import post_json_with_retry
+from app.core.gateway_resilience import resilience_execute
 from app.core.logger_setup import log_event
 
 logger = logging.getLogger(__name__)
@@ -71,29 +72,37 @@ class LiteLLMEmbeddings:
 
         start = time.perf_counter()
         try:
-            resp = post_json_with_retry(
-                url=url,
-                headers=headers,
-                body=body,
-                timeout_seconds=self.timeout,
-                retry_count=self.retry_count,
-                component="litellm",
-                operation="embeddings",
-                accepted_error_statuses=[400, 404, 422],
+            resp = resilience_execute(
+                component="external_api",
+                operation="embeddings_request",
+                func=lambda: post_json_with_retry(
+                    url=url,
+                    headers=headers,
+                    body=body,
+                    timeout_seconds=self.timeout,
+                    retry_count=self.retry_count,
+                    component="litellm",
+                    operation="embeddings",
+                    accepted_error_statuses=[400, 404, 422],
+                ),
             )
             if resp.status_code >= 400 and self.dimensions:
                 fallback_body = {
                     "model": self.model,
                     "input": inputs,
                 }
-                fallback_resp = post_json_with_retry(
-                    url=url,
-                    headers=headers,
-                    body=fallback_body,
-                    timeout_seconds=self.timeout,
-                    retry_count=self.retry_count,
-                    component="litellm",
-                    operation="embeddings",
+                fallback_resp = resilience_execute(
+                    component="external_api",
+                    operation="embeddings_request_fallback",
+                    func=lambda: post_json_with_retry(
+                        url=url,
+                        headers=headers,
+                        body=fallback_body,
+                        timeout_seconds=self.timeout,
+                        retry_count=self.retry_count,
+                        component="litellm",
+                        operation="embeddings",
+                    ),
                 )
                 payload = fallback_resp.json()
             else:
@@ -198,15 +207,19 @@ def rerank_texts_with_litellm(query: str, texts: List[str], top_n: Optional[int]
     for idx, url in enumerate(urls):
         start = time.perf_counter()
         try:
-            resp = post_json_with_retry(
-                url=url,
-                headers=headers,
-                body=body,
-                timeout_seconds=timeout,
-                retry_count=rerank_cfg.retry_count,
-                component="litellm",
-                operation="rerank",
-                accepted_error_statuses=[404],
+            resp = resilience_execute(
+                component="external_api",
+                operation="rerank_request",
+                func=lambda: post_json_with_retry(
+                    url=url,
+                    headers=headers,
+                    body=body,
+                    timeout_seconds=timeout,
+                    retry_count=rerank_cfg.retry_count,
+                    component="litellm",
+                    operation="rerank",
+                    accepted_error_statuses=[404],
+                ),
             )
             if resp.status_code == 404 and idx < len(urls) - 1:
                 continue

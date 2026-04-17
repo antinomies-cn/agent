@@ -32,7 +32,7 @@ def post_json_with_retry(
     component: str,
     operation: str,
     accepted_error_statuses: Optional[Iterable[int]] = None,
-) -> requests.Response:
+) -> Any:
     """POST JSON with bounded retries; returns response for optional accepted error statuses."""
     accepted = set(accepted_error_statuses or [])
     max_retries = max(int(retry_count or 0), 0)

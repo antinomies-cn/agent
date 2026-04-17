@@ -6,7 +6,10 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-import redis
+try:
+    import redis
+except Exception:  # pragma: no cover - optional in minimal test env
+    redis = None
 from fastapi import HTTPException, Request, WebSocket
 
 from app.core.config import GatewaySecuritySettings, get_redis_settings
@@ -84,17 +87,18 @@ class FixedWindowRateLimiter:
     def __init__(self) -> None:
         self._mem_lock = threading.Lock()
         self._mem_counters: Dict[str, Tuple[int, int]] = {}
-        self._redis_client: Optional[redis.Redis] = None
+        self._redis_client = None
 
         redis_url = _build_redis_url_from_env()
         try:
-            self._redis_client = redis.Redis.from_url(
-                redis_url,
-                decode_responses=True,
-                socket_connect_timeout=0.2,
-                socket_timeout=0.2,
-            )
-            self._redis_client.ping()
+            if redis is not None:
+                self._redis_client = redis.Redis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=0.2,
+                    socket_timeout=0.2,
+                )
+                self._redis_client.ping()
         except Exception:
             self._redis_client = None
 
