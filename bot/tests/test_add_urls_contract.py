@@ -738,3 +738,54 @@ def test_cors_preflight_passes_when_gateway_auth_enabled(monkeypatch):
 
     assert resp.status_code in {200, 204}
     assert "access-control-allow-origin" in {k.lower() for k in resp.headers.keys()}
+
+
+def test_main_exports_qdrant_symbol_for_monkeypatch_compat():
+    # ingestion router resolves Qdrant from app.main for backward-compatible monkeypatching.
+    assert hasattr(main, "Qdrant")
+
+
+def test_health_endpoint_returns_unhealthy_when_master_missing(monkeypatch):
+    monkeypatch.setattr(main, "master", None)
+
+    client = TestClient(main.app)
+    resp = client.get("/health")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "unhealthy"
+    assert body["error_code"] == "HEALTH_CHECK_ERROR"
+    assert body["explanation"]
+
+
+def test_memory_status_invalid_session_and_runtime_error(monkeypatch):
+    client = TestClient(main.app)
+
+    bad = client.get("/memory/status", params={"session_id": " "})
+    assert bad.status_code == 400
+    bad_body = bad.json()
+    assert bad_body["error_code"] == "INVALID_SESSION_ID"
+    assert bad_body["explanation"]
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("memory backend down")
+
+    monkeypatch.setattr(main.master, "get_memory_status", _raise)
+    err = client.get("/memory/status", params={"session_id": "s1"})
+    assert err.status_code == 200
+    err_body = err.json()
+    assert err_body["code"] == 500
+    assert err_body["error_code"] == "MEMORY_STATUS_ERROR"
+    assert err_body["explanation"]
+
+
+def test_chat_returns_500_http_when_master_missing(monkeypatch):
+    monkeypatch.setattr(main, "master", None)
+
+    client = TestClient(main.app)
+    resp = client.post("/chat", params={"query": "hi", "session_id": "s1"})
+
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["error_code"] == "HTTP_500"
+    assert body["explanation"]

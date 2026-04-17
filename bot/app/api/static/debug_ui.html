@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>工具调试台</title>
+        <style>
+            :root {
+                --bg: #f4f1ea;
+                --ink: #1e1e1e;
+                --accent: #2f5d50;
+                --card: #ffffff;
+                --border: #e3ddcf;
+            }
+            body {
+                margin: 0;
+                font-family: "Georgia", "Times New Roman", serif;
+                background: radial-gradient(circle at top left, #f7efe0 0%, #f4f1ea 45%, #efe7d6 100%);
+                color: var(--ink);
+            }
+            header {
+                padding: 24px 32px 12px;
+            }
+            h1 {
+                margin: 0 0 6px;
+                font-size: 28px;
+                letter-spacing: 0.5px;
+            }
+            p.sub {
+                margin: 0;
+                color: #5a5348;
+            }
+            .grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 16px;
+                padding: 16px 32px 32px;
+            }
+            .card {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 16px;
+                box-shadow: 0 6px 16px rgba(40, 34, 26, 0.08);
+            }
+            .card h2 {
+                margin: 0 0 8px;
+                font-size: 18px;
+            }
+            label {
+                display: block;
+                font-size: 13px;
+                color: #5a5348;
+                margin-bottom: 6px;
+            }
+            input, textarea, select {
+                width: 100%;
+                padding: 8px 10px;
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                font-size: 14px;
+                background: #fcfbf8;
+                box-sizing: border-box;
+            }
+            textarea {
+                min-height: 90px;
+                resize: vertical;
+            }
+            button {
+                margin-top: 10px;
+                background: var(--accent);
+                color: #fff;
+                border: none;
+                border-radius: 10px;
+                padding: 8px 14px;
+                cursor: pointer;
+            }
+            pre {
+                background: #1b1a17;
+                color: #e8e5de;
+                padding: 10px;
+                border-radius: 10px;
+                overflow: auto;
+                max-height: 240px;
+                font-size: 12px;
+            }
+            .row {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 8px;
+            }
+            @media (max-width: 720px) {
+                header, .grid { padding: 16px; }
+                .row { grid-template-columns: 1fr; }
+            }
+        </style>
+    </head>
+    <body>
+        <header>
+            <h1>工具调试台</h1>
+            <p class="sub">仅用于本地/测试环境。返回结构统一为 {tool, ok, code, data, error}。</p>
+        </header>
+        <section class="grid">
+            <div class="card">
+                <h2>系统自检</h2>
+                <label>scope</label>
+                <select id="test-scope">
+                    <option value="all">all</option>
+                    <option value="astro">astro</option>
+                    <option value="vector">vector</option>
+                    <option value="search">search</option>
+                </select>
+                <button onclick="callTool('/tools/test', {scope: byId('test-scope').value}, 'out-test')">执行</button>
+                <pre id="out-test"></pre>
+            </div>
+
+            <div class="card">
+                <h2>Chat</h2>
+                <label>query</label>
+                <textarea id="chat-query" placeholder="输入对话内容"></textarea>
+                <label>session_id</label>
+                <input id="chat-session" placeholder="session id" />
+                <button onclick="callToolQuery('/chat', {query: byId('chat-query').value, session_id: byId('chat-session').value}, {}, 'out-chat')">执行</button>
+                <pre id="out-chat"></pre>
+            </div>
+
+            <div class="card">
+                <h2>联网搜索</h2>
+                <label>query</label>
+                <input id="search-query" placeholder="输入搜索关键词" />
+                <button onclick="callTool('/tools/search', {query: byId('search-query').value}, 'out-search')">执行</button>
+                <pre id="out-search"></pre>
+            </div>
+
+            <div class="card">
+                <h2>向量检索</h2>
+                <label>query</label>
+                <input id="vector-query" placeholder="输入检索关键词" />
+                <button onclick="callTool('/tools/vector_search', {query: byId('vector-query').value}, 'out-vector')">执行</button>
+                <pre id="out-vector"></pre>
+            </div>
+
+            <div class="card">
+                <h2>add_urls / dry_run</h2>
+                <label>url</label>
+                <input id="add-url" placeholder="单个URL" />
+                <label>urls（每行一个）</label>
+                <textarea id="add-urls" placeholder="https://example.com\nhttps://example.org"></textarea>
+                <label>chunk_strategy</label>
+                <select id="add-strategy">
+                    <option value="balanced">balanced</option>
+                    <option value="faq">faq</option>
+                    <option value="article">article</option>
+                    <option value="custom">custom</option>
+                </select>
+                <div class="row">
+                    <div>
+                        <label>chunk_size</label>
+                        <input id="add-size" placeholder="可选" />
+                    </div>
+                    <div>
+                        <label>chunk_overlap</label>
+                        <input id="add-overlap" placeholder="可选" />
+                    </div>
+                    <div>
+                        <label>preview_limit</label>
+                        <input id="add-preview" placeholder="默认3" />
+                    </div>
+                    <div>
+                        <label>separators（每行一个）</label>
+                        <input id="add-seps" placeholder="仅custom建议填写" />
+                    </div>
+                </div>
+                <button onclick="callTool('/add_urls/dry_run', buildAddUrlsPayload(), 'out-add-dry')">执行</button>
+                <pre id="out-add-dry"></pre>
+            </div>
+        </section>
+        <script>
+            function byId(id) { return document.getElementById(id); }
+            function linesToList(text) {
+                return (text || "")
+                    .split(/\r?\n/)
+                    .map(function (line) { return line.trim(); })
+                    .filter(Boolean);
+            }
+            function numOrNull(id) {
+                var raw = (byId(id).value || "").trim();
+                if (!raw) return null;
+                var val = parseInt(raw, 10);
+                return isNaN(val) ? raw : val;
+            }
+            async function callTool(path, payload, outputId) {
+                var out = byId(outputId);
+                out.textContent = "loading...";
+                try {
+                    var res = await fetch(path, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload || {}),
+                    });
+                    var text = await res.text();
+                    try {
+                        out.textContent = JSON.stringify(JSON.parse(text), null, 2);
+                    } catch (e) {
+                        out.textContent = text;
+                    }
+                } catch (err) {
+                    out.textContent = String(err);
+                }
+            }
+            async function callToolQuery(path, queryParams, payload, outputId) {
+                var out = byId(outputId);
+                out.textContent = "loading...";
+                try {
+                    var query = new URLSearchParams(queryParams || {}).toString();
+                    var url = query ? path + "?" + query : path;
+                    var res = await fetch(url, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload || {}),
+                    });
+                    var text = await res.text();
+                    try {
+                        out.textContent = JSON.stringify(JSON.parse(text), null, 2);
+                    } catch (e) {
+                        out.textContent = text;
+                    }
+                } catch (err) {
+                    out.textContent = String(err);
+                }
+            }
+            function buildAddUrlsPayload() {
+                var payload = {
+                    chunk_strategy: byId('add-strategy').value,
+                };
+                var url = (byId('add-url').value || "").trim();
+                if (url) payload.url = url;
+                var urls = linesToList(byId('add-urls').value);
+                if (urls.length) payload.urls = urls;
+                var chunkSize = numOrNull('add-size');
+                if (chunkSize !== null) payload.chunk_size = chunkSize;
+                var chunkOverlap = numOrNull('add-overlap');
+                if (chunkOverlap !== null) payload.chunk_overlap = chunkOverlap;
+                var previewLimit = numOrNull('add-preview');
+                if (previewLimit !== null) payload.preview_limit = previewLimit;
+                var separators = linesToList(byId('add-seps').value);
+                if (separators.length) payload.separators = separators;
+                return payload;
+            }
+        </script>
+    </body>
+</html>
