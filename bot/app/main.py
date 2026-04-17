@@ -64,6 +64,7 @@ from app.core.logger_setup import (
     summarize_text_for_log,
 )
 from app.core.litellm_adapters import build_litellm_embeddings_client
+from app.services import add_urls_service
 from app.services.master_service import Master
 from app.tools.mytools import (
     astro_current_chart,
@@ -1288,6 +1289,32 @@ def _build_embeddings_client(vector_size: int):
     """统一走 LiteLLM embeddings 模型（默认 bge-m3）。"""
     embedding_cfg = resolve_embedding_config(default_dimension=vector_size)
     return build_litellm_embeddings_client(default_dimensions=embedding_cfg.dimensions)
+
+
+# 渐进拆分：将 add_urls 核心业务逻辑下沉到 service 层，API 层仅保留路由与契约。
+_build_chunking_config = add_urls_service._build_chunking_config
+_chunk_documents = add_urls_service._chunk_documents
+_normalize_urls = add_urls_service._normalize_urls
+_get_add_urls_fetch_timeout_seconds = add_urls_service._get_add_urls_fetch_timeout_seconds
+_get_add_urls_fetch_retry_count = add_urls_service._get_add_urls_fetch_retry_count
+_get_add_urls_fetch_backoff_seconds = add_urls_service._get_add_urls_fetch_backoff_seconds
+_get_add_urls_max_content_chars = add_urls_service._get_add_urls_max_content_chars
+_get_add_urls_error_explanation = add_urls_service._get_add_urls_error_explanation
+_normalize_failed_urls = add_urls_service._normalize_failed_urls
+_is_public_http_url = add_urls_service._is_public_http_url
+_partition_safe_urls = add_urls_service._partition_safe_urls
+_ensure_add_urls_write_enabled = add_urls_service._ensure_add_urls_write_enabled
+_collect_chunks_from_urls = add_urls_service._collect_chunks_from_urls
+_compute_chunk_quality_report = add_urls_service._compute_chunk_quality_report
+_resolve_embedding_output_dim = add_urls_service._resolve_embedding_output_dim
+VectorSizeMismatchError = add_urls_service.VectorSizeMismatchError
+_extract_collection_vector_size = add_urls_service._extract_collection_vector_size
+_fetch_collection_vector_size_via_http = add_urls_service._fetch_collection_vector_size_via_http
+_recreate_collection_with_dim = add_urls_service._recreate_collection_with_dim
+_is_vector_dim_mismatch_error = add_urls_service._is_vector_dim_mismatch_error
+_resolve_qdrant_distance = add_urls_service._resolve_qdrant_distance
+_ensure_qdrant_collection = add_urls_service._ensure_qdrant_collection
+_build_embeddings_client = add_urls_service._build_embeddings_client
 
 @app.get("/", summary="根路径", description="基础连通性检查，返回简单响应。")
 def read_root():
