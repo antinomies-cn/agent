@@ -4,8 +4,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 
-from app.api.deps import resolve_runtime_dependency
+from app.api.deps import build_error_response, build_success_response, resolve_runtime_dependency
 from app.core.logger_setup import logger, log_event, mask_session_id, summarize_error_for_log, summarize_text_for_log
+from app.core.logger_setup import set_observability_context, set_trace_id, clear_observability_context
+from app.core.monitoring import emit_alert
 from app.core.texts import USER_MESSAGES
 
 router = APIRouter()
@@ -14,7 +16,11 @@ router = APIRouter()
 @router.get("/", summary="根路径", description="基础连通性检查，返回简单响应。")
 def read_root():
     logger.info("访问根路径")
-    return {"Hello": "World"}
+    return build_success_response(
+        data={"hello": "World"},
+        message="服务可用",
+        Hello="World",
+    )
 
 
 @router.post("/chat", summary="对话接口", description="主对话入口。query 为用户输入，session_id 用于会话隔离。")
@@ -52,7 +58,18 @@ def chat(
             mask_session_id(session_id),
             summarize_text_for_log(response_text, preview_chars=24),
         )
-        return {"code": 200, "session_id": session_id, "query": query, "response": response_text}
+        return build_success_response(
+            data={
+                "session_id": session_id,
+                "query": query,
+                "response": response_text,
+            },
+            message="对话成功",
+            code=200,
+            session_id=session_id,
+            query=query,
+            response=response_text,
+        )
     except Exception as e:
         error_msg = str(e)[:100]
         logger.error(
@@ -62,15 +79,20 @@ def chat(
             summarize_error_for_log(error_msg),
             exc_info=True,
         )
-        return {
-            "code": 500,
-            "error_code": "CHAT_RUNTIME_ERROR",
-            "explanation": common_errors.get("CHAT_RUNTIME_ERROR", "对话处理失败"),
-            "error": error_msg,
-            "session_id": session_id,
-            "query": query,
-            "response": f"错误：{error_msg}",
-        }
+        return build_error_response(
+            code=500,
+            error_code="CHAT_RUNTIME_ERROR",
+            message="对话处理失败",
+            error=error_msg,
+            data={
+                "session_id": session_id,
+                "query": query,
+            },
+            explanation=common_errors.get("CHAT_RUNTIME_ERROR", "对话处理失败"),
+            session_id=session_id,
+            query=query,
+            response=f"错误：{error_msg}",
+        )
 
 
 @router.websocket("/ws")
@@ -98,6 +120,7 @@ async def ws(websocket: WebSocket):
 
     await websocket.accept()
     client_ip = websocket.client.host
+    ws_trace_id = set_trace_id((websocket.headers.get("x-trace-id") or "").strip())
     session_id = (websocket.query_params.get("session_id") or "").strip()
     if not session_id:
         logger.warning("WebSocket连接拒绝 | 客户端IP: %s | 原因: session_id不能为空", client_ip)
@@ -111,6 +134,7 @@ async def ws(websocket: WebSocket):
         return
 
     ws_start = time.perf_counter()
+    set_observability_context(trace_id=ws_trace_id, request_path="/ws", session_id=session_id)
     logger.info("WebSocket连接建立 | 客户端IP: %s | session_id: %s", client_ip, mask_session_id(session_id))
     log_event(
         logging.INFO,
@@ -120,14 +144,25 @@ async def ws(websocket: WebSocket):
     )
 
     try:
+        msg_index = 0
         while True:
+            msg_index += 1
             data = await websocket.receive_text()
             msg_start = time.perf_counter()
+            set_observability_context(trace_id=ws_trace_id, request_path="/ws", session_id=session_id)
             logger.info(
                 "WebSocket接收消息 | 客户端IP: %s | session_id: %s | input: %s",
                 client_ip,
                 mask_session_id(session_id),
                 summarize_text_for_log(data, preview_chars=24),
+            )
+            log_event(
+                logging.INFO,
+                "ws.message.received",
+                client_ip=client_ip,
+                session_id=session_id,
+                message_index=msg_index,
+                input_len=len(data),
             )
 
             res = await master.run_async(data, session_id=session_id)
@@ -144,6 +179,7 @@ async def ws(websocket: WebSocket):
                 "ws.message",
                 client_ip=client_ip,
                 session_id=session_id,
+                message_index=msg_index,
                 input_len=len(data),
                 output_len=len(clean_response),
                 elapsed_ms=int((time.perf_counter() - msg_start) * 1000),
@@ -160,6 +196,15 @@ async def ws(websocket: WebSocket):
         )
     except Exception as e:
         logger.error(f"WebSocket异常 | 客户端IP: {client_ip} | 错误: {str(e)[:100]}", exc_info=True)
+        emit_alert(
+            alert_type="ws_runtime_error",
+            severity="error",
+            source="conversation.ws",
+            message="WebSocket 运行时异常",
+            session_id=session_id,
+            client_ip=client_ip,
+            error=str(e)[:180],
+        )
         log_event(
             logging.ERROR,
             "ws.error",
@@ -169,3 +214,5 @@ async def ws(websocket: WebSocket):
             elapsed_ms=int((time.perf_counter() - ws_start) * 1000),
         )
         await websocket.close(code=1011, reason="服务器内部错误")
+    finally:
+        clear_observability_context()

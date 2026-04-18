@@ -263,6 +263,43 @@ def test_ops_health_live_returns_current_env(monkeypatch):
     assert body["env"] == "development"
 
 
+def test_ops_metrics_snapshot_endpoint_returns_structured_data():
+    client = TestClient(main.app)
+    resp = client.get("/ops/metrics")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["code"] == 200
+    assert "data" in body
+    assert "http_requests_total" in body["data"]
+    assert "llm_tokens_total" in body["data"]
+
+
+def test_prometheus_metrics_endpoint_returns_text_payload():
+    client = TestClient(main.app)
+    # 先触发一次请求，确保有基础指标可输出。
+    _ = client.get("/health/live")
+
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers.get("content-type", "")
+    assert "app_http_requests_total" in resp.text
+    assert "app_llm_tokens_total" in resp.text
+
+
+def test_ops_alerts_snapshot_endpoint_returns_structured_data():
+    client = TestClient(main.app)
+    resp = client.get("/ops/alerts")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["code"] == 200
+    assert "alerts_total" in body["data"]
+    assert "llm_timeout_streak" in body["data"]
+
+
 def test_conversation_ws_happy_path(monkeypatch):
     monkeypatch.setattr(main, "ensure_websocket_auth", lambda *args, **kwargs: None)
     monkeypatch.setattr(main, "ensure_ws_rate_limit", lambda *args, **kwargs: None)

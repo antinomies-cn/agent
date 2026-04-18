@@ -9,7 +9,8 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from app.core.config import IS_PROD, get_llm_gateway_settings, normalize_openai_base_url
 from app.core.gateway_http import post_json_with_retry
 from app.core.gateway_resilience import CircuitOpenError, resilience_execute
-from app.core.logger_setup import logger, log_event
+from app.core.logger_setup import logger, log_event, get_request_path
+from app.core.monitoring import emit_alert, record_llm_call, record_llm_usage
 from app.core.texts import USER_MESSAGES
 
 # 线程本地上下文：为LLM请求传递每次调用的超时。
@@ -108,6 +109,31 @@ class CustomProxyLLM(BaseChatModel):
                 continue
             valid_calls.append(call)
         return valid_calls
+
+    @staticmethod
+    def _extract_usage(payload: dict) -> dict:
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        def _to_non_negative_int(value) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return 0
+            return max(parsed, 0)
+
+        prompt_tokens = _to_non_negative_int(usage.get("prompt_tokens"))
+        completion_tokens = _to_non_negative_int(usage.get("completion_tokens"))
+        total_tokens = _to_non_negative_int(usage.get("total_tokens"))
+        if total_tokens == 0:
+            total_tokens = prompt_tokens + completion_tokens
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
 
     @staticmethod
     def _resolve_timeout_seconds(default_timeout: float = 60.0) -> float:
@@ -223,7 +249,9 @@ class CustomProxyLLM(BaseChatModel):
             result = resp.json()
             content = self._extract_content(result)
             tool_calls = self._extract_tool_calls(result)
+            usage = self._extract_usage(result)
             elapsed = time.perf_counter() - call_start
+            path = get_request_path() or "unknown"
             logger.info(
                 "LLM调用成功，响应长度: %s | tool_calls: %s | 耗时: %.2f秒",
                 len(content),
@@ -236,7 +264,32 @@ class CustomProxyLLM(BaseChatModel):
                 model=effective_model,
                 tool_calls=len(tool_calls),
                 output_len=len(content),
+                prompt_tokens=usage["prompt_tokens"],
+                completion_tokens=usage["completion_tokens"],
+                total_tokens=usage["total_tokens"],
                 elapsed_ms=int(elapsed * 1000),
+            )
+            log_event(
+                logging.INFO,
+                "llm.usage",
+                model=effective_model,
+                path=path,
+                prompt_tokens=usage["prompt_tokens"],
+                completion_tokens=usage["completion_tokens"],
+                total_tokens=usage["total_tokens"],
+            )
+            record_llm_call(
+                model=effective_model,
+                path=path,
+                status="success",
+                elapsed_ms=int(elapsed * 1000),
+            )
+            record_llm_usage(
+                model=effective_model,
+                path=path,
+                prompt_tokens=usage["prompt_tokens"],
+                completion_tokens=usage["completion_tokens"],
+                total_tokens=usage["total_tokens"],
             )
             return content, tool_calls
 
@@ -265,6 +318,19 @@ class CustomProxyLLM(BaseChatModel):
                 user_msg = USER_MESSAGES["http"]["default"]
 
             logger.error("%s | 详细信息: %s", error_log, error_info)
+            record_llm_call(
+                model=(effective_model if "effective_model" in locals() else "unknown"),
+                path=get_request_path() or "unknown",
+                status="http_error",
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
+            emit_alert(
+                alert_type="llm_http_error",
+                severity="error",
+                source="llm",
+                message="LLM HTTP 调用异常",
+                status_code=status_code,
+            )
             log_event(
                 logging.ERROR,
                 "llm.http_error",
@@ -278,6 +344,19 @@ class CustomProxyLLM(BaseChatModel):
             timeout_seconds = self._resolve_timeout_seconds()
             error_info = {"type": "TIMEOUT", "timeout": timeout_seconds}
             logger.error("LLM调用超时（%s秒） | 详细信息: %s", timeout_seconds, error_info)
+            record_llm_call(
+                model=(effective_model if "effective_model" in locals() else "unknown"),
+                path=get_request_path() or "unknown",
+                status="timeout",
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
+            emit_alert(
+                alert_type="llm_timeout",
+                severity="critical",
+                source="llm",
+                message="LLM 调用超时",
+                timeout_seconds=timeout_seconds,
+            )
             log_event(
                 logging.ERROR,
                 "llm.timeout",
@@ -288,6 +367,19 @@ class CustomProxyLLM(BaseChatModel):
 
         except CircuitOpenError as e:
             logger.warning("LLM熔断开启 | component=%s | operation=%s", e.component, e.operation)
+            record_llm_call(
+                model=(effective_model if "effective_model" in locals() else "unknown"),
+                path=get_request_path() or "unknown",
+                status="circuit_open",
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
+            emit_alert(
+                alert_type="llm_circuit_open",
+                severity="critical",
+                source="llm",
+                message="LLM 熔断开启",
+                retry_after_seconds=e.retry_after_seconds,
+            )
             log_event(
                 logging.WARNING,
                 "llm.circuit_open",
@@ -301,6 +393,12 @@ class CustomProxyLLM(BaseChatModel):
         except requests.exceptions.ConnectionError:
             error_info = {"type": "CONNECTION_ERROR", "url": url if "url" in locals() else ""}
             logger.error("LLM调用失败：网络连接异常 | 详细信息: %s", error_info)
+            record_llm_call(
+                model=(effective_model if "effective_model" in locals() else "unknown"),
+                path=get_request_path() or "unknown",
+                status="connection_error",
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
             log_event(
                 logging.ERROR,
                 "llm.connection_error",
@@ -313,6 +411,12 @@ class CustomProxyLLM(BaseChatModel):
             response_text = resp.text[:200] if "resp" in locals() else ""
             error_info = {"type": "KEY_ERROR", "missing_key": str(e), "response_text": response_text}
             logger.error("LLM响应解析失败：缺失字段 %s | 详细信息: %s", e, error_info)
+            record_llm_call(
+                model=(effective_model if "effective_model" in locals() else "unknown"),
+                path=get_request_path() or "unknown",
+                status="parse_error",
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
             log_event(
                 logging.ERROR,
                 "llm.parse_error",
@@ -324,6 +428,12 @@ class CustomProxyLLM(BaseChatModel):
         except Exception as e:
             error_info = {"type": "UNKNOWN_ERROR", "error": str(e)[:100]}
             logger.error("LLM未知异常 | 详细信息: %s", error_info, exc_info=True)
+            record_llm_call(
+                model=(effective_model if "effective_model" in locals() else "unknown"),
+                path=get_request_path() or "unknown",
+                status="error",
+                elapsed_ms=int((time.perf_counter() - call_start) * 1000),
+            )
             log_event(
                 logging.ERROR,
                 "llm.error",

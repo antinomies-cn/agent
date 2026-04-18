@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from langchain_community.vectorstores import Qdrant
 from qdrant_client import QdrantClient
 
-from app.api.deps import resolve_add_urls_payload, resolve_runtime_dependency
+from app.api.deps import build_success_response, resolve_add_urls_payload, resolve_runtime_dependency
 from app.core.config import get_qdrant_settings
 from app.core.embedding_config import resolve_embedding_config
 from app.core.gateway_resilience import CircuitOpenError, resilience_execute
@@ -308,10 +308,10 @@ def add_urls_dry_run(
 @router.post("/add_pdfs", summary="PDF入库占位", description="占位接口：未来支持PDF解析与入库。")
 def add_pdfs():
     logger.info("调用add_pdfs接口")
-    return {"response": "PDFs added!"}
+    return build_success_response(data={"response": "PDFs added!"}, message="PDF 入库占位接口调用成功", response="PDFs added!")
 
 
 @router.post("/add_texts", summary="文本入库占位", description="占位接口：未来支持直接文本入库。")
 def add_texts():
     logger.info("调用add_texts接口")
-    return {"response": "Texts added!"}
+    return build_success_response(data={"response": "Texts added!"}, message="文本入库占位接口调用成功", response="Texts added!")

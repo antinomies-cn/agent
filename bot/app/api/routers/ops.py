@@ -3,13 +3,15 @@ import time
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from app.api.deps import resolve_runtime_dependency
+from app.api.deps import build_error_response, build_success_response, resolve_runtime_dependency
 from app.core.config import build_config_health_summary, get_qdrant_settings, get_rerank_gateway_settings
 from app.core.embedding_config import resolve_embedding_config
 from app.core.gateway_resilience import get_resilience_snapshot
 from app.core.logger_setup import logger, mask_session_id, summarize_error_for_log
+from app.core.monitoring import get_metrics_snapshot, render_prometheus_metrics
 
 router = APIRouter()
 
@@ -49,12 +51,13 @@ def _ops_error(code: str, err: str) -> dict:
         "QDRANT_COLLECTIONS_ERROR": "Qdrant 集合读取失败，请检查连接与权限。",
         "QDRANT_STATUS_ERROR": "Qdrant 状态读取失败，请检查连接与权限。",
     }
-    return {
-        "code": 500,
-        "error_code": code,
-        "error": err,
-        "explanation": messages.get(code, "请求处理失败"),
-    }
+    return build_error_response(
+        code=500,
+        error_code=code,
+        message="请求处理失败",
+        error=err,
+        explanation=messages.get(code, "请求处理失败"),
+    )
 
 
 @router.post(
@@ -72,7 +75,7 @@ def init_qdrant(
         if init_qdrant_collection is None:
             raise RuntimeError("qdrant init dependency unavailable")
         result = init_qdrant_collection(collection_name=collection, force_recreate=recreate)
-        return {"code": 200, "data": result}
+        return build_success_response(data=result, code=200, message="Qdrant 初始化完成")
     except Exception as e:
         return _ops_error("QDRANT_INIT_ERROR", str(e)[:120])
 
@@ -92,7 +95,7 @@ def recreate_qdrant(
         if recreate_qdrant_collection is None:
             raise RuntimeError("qdrant recreate dependency unavailable")
         result = recreate_qdrant_collection(collection_name=target)
-        return {"code": 200, "data": result}
+        return build_success_response(data=result, code=200, message="Qdrant 重建完成")
     except Exception as e:
         return _ops_error("QDRANT_RECREATE_ERROR", str(e)[:120])
 
@@ -105,7 +108,7 @@ def qdrant_health_check():
         if qdrant_health is None:
             raise RuntimeError("qdrant health dependency unavailable")
         result = qdrant_health()
-        return {"code": 200, "data": result}
+        return build_success_response(data=result, code=200, message="Qdrant 健康检查完成")
     except Exception as e:
         return _ops_error("QDRANT_HEALTH_ERROR", str(e)[:120])
 
@@ -118,7 +121,7 @@ def qdrant_collections():
         if qdrant_list_collections is None:
             raise RuntimeError("qdrant collections dependency unavailable")
         result = qdrant_list_collections()
-        return {"code": 200, "data": result}
+        return build_success_response(data=result, code=200, message="Qdrant 集合读取完成")
     except Exception as e:
         return _ops_error("QDRANT_COLLECTIONS_ERROR", str(e)[:120])
 
@@ -131,7 +134,7 @@ def qdrant_status():
         if qdrant_repo_status is None:
             raise RuntimeError("qdrant status dependency unavailable")
         result = qdrant_repo_status()
-        return {"code": 200, "data": result}
+        return build_success_response(data=result, code=200, message="Qdrant 状态读取完成")
     except Exception as e:
         return _ops_error("QDRANT_STATUS_ERROR", str(e)[:120])
 
@@ -143,15 +146,13 @@ def qdrant_status():
 )
 def config_health():
     summary = build_config_health_summary()
-    return {
-        "code": 200,
-        "data": {
-            "ok": bool(summary.get("ok", False)),
-            "warnings": list(summary.get("warnings", ())),
-            "errors": list(summary.get("errors", ())),
-            "highlights": dict(summary.get("highlights", {})),
-        },
+    data = {
+        "ok": bool(summary.get("ok", False)),
+        "warnings": list(summary.get("warnings", ())),
+        "errors": list(summary.get("errors", ())),
+        "highlights": dict(summary.get("highlights", {})),
     }
+    return build_success_response(data=data, code=200, message="配置健康摘要读取完成")
 
 
 @router.get(
@@ -199,6 +200,46 @@ def gateway_resilience_status():
     return [CircuitBreakerStatusItem(**item) for item in get_resilience_snapshot()]
 
 
+@router.get(
+    "/ops/metrics",
+    summary="监控快照",
+    description="返回进程内聚合的监控快照（JSON），用于快速排障。",
+)
+def ops_metrics_snapshot():
+    return build_success_response(
+        data=get_metrics_snapshot(),
+        code=200,
+        message="监控快照读取完成",
+    )
+
+
+@router.get(
+    "/ops/alerts",
+    summary="告警状态",
+    description="返回当前告警累计状态与规则关联计数。",
+)
+def ops_alerts_snapshot():
+    data = get_metrics_snapshot()
+    return build_success_response(
+        data={
+            "alerts_total": data.get("alerts_total", []),
+            "llm_timeout_streak": data.get("llm_timeout_streak", []),
+        },
+        code=200,
+        message="告警状态读取完成",
+    )
+
+
+@router.get(
+    "/metrics",
+    response_class=PlainTextResponse,
+    summary="Prometheus 指标",
+    description="导出 Prometheus 文本格式指标。",
+)
+def prometheus_metrics():
+    return PlainTextResponse(content=render_prometheus_metrics(), media_type="text/plain; version=0.0.4")
+
+
 @router.get("/health", summary="服务健康检查", description="检查服务与LLM连通性，返回运行状态。")
 async def health_check():
     master = resolve_runtime_dependency("master", None)
@@ -206,13 +247,17 @@ async def health_check():
     common_errors = resolve_runtime_dependency("_COMMON_ERROR_EXPLANATIONS", {})
 
     if master is None:
-        return {
-            "status": "unhealthy",
-            "timestamp": time.time(),
-            "error": "master service unavailable",
-            "error_code": "HEALTH_CHECK_ERROR",
-            "explanation": common_errors.get("HEALTH_CHECK_ERROR", "健康检查失败"),
-        }
+        timestamp = time.time()
+        return build_error_response(
+            code=500,
+            error_code="HEALTH_CHECK_ERROR",
+            message="健康检查失败",
+            error="master service unavailable",
+            data={"status": "unhealthy", "timestamp": timestamp},
+            explanation=common_errors.get("HEALTH_CHECK_ERROR", "健康检查失败"),
+            status="unhealthy",
+            timestamp=timestamp,
+        )
 
     try:
         llm_ok = await asyncio.to_thread(master.check_llm_health)
@@ -224,27 +269,32 @@ async def health_check():
             "env": "production" if is_prod_runtime() else "development",
         }
         logger.info(f"健康检查 | 状态: {health_info}")
-        return health_info
+        return build_success_response(data=health_info, code=200, message="健康检查完成", **health_info)
     except Exception as e:
         logger.error(f"健康检查异常 | 错误: {str(e)[:100]}", exc_info=True)
-        return {
-            "status": "unhealthy",
-            "timestamp": time.time(),
-            "error": str(e)[:100],
-            "error_code": "HEALTH_CHECK_ERROR",
-            "explanation": common_errors.get("HEALTH_CHECK_ERROR", "健康检查失败"),
-        }
+        timestamp = time.time()
+        return build_error_response(
+            code=500,
+            error_code="HEALTH_CHECK_ERROR",
+            message="健康检查失败",
+            error=str(e)[:100],
+            data={"status": "unhealthy", "timestamp": timestamp},
+            explanation=common_errors.get("HEALTH_CHECK_ERROR", "健康检查失败"),
+            status="unhealthy",
+            timestamp=timestamp,
+        )
 
 
 @router.get("/health/live", summary="服务存活检查", description="轻量存活检查，不依赖LLM。")
 def health_live():
     is_prod_runtime = resolve_runtime_dependency("_is_prod_runtime", lambda: False)
 
-    return {
+    data = {
         "status": "healthy",
         "timestamp": time.time(),
         "env": "production" if is_prod_runtime() else "development",
     }
+    return build_success_response(data=data, code=200, message="存活检查通过", **data)
 
 
 @router.get("/memory/status", summary="会话记忆状态", description="按 session_id 查询会话记忆状态。")
@@ -263,13 +313,15 @@ def memory_status(session_id: str):
         )
 
     if master is None:
-        return {
-            "code": 500,
-            "error_code": "MEMORY_STATUS_ERROR",
-            "session_id": session_id,
-            "error": "master service unavailable",
-            "explanation": common_errors.get("MEMORY_STATUS_ERROR", "会话记忆读取失败"),
-        }
+        return build_error_response(
+            code=500,
+            error_code="MEMORY_STATUS_ERROR",
+            message="会话记忆读取失败",
+            error="master service unavailable",
+            data={"session_id": session_id},
+            explanation=common_errors.get("MEMORY_STATUS_ERROR", "会话记忆读取失败"),
+            session_id=session_id,
+        )
 
     try:
         status = master.get_memory_status(session_id)
@@ -278,7 +330,7 @@ def memory_status(session_id: str):
             mask_session_id(status["session_id"]),
             status["message_count"],
         )
-        return {"code": 200, "data": status}
+        return build_success_response(data=status, code=200, message="会话记忆读取成功")
     except Exception as e:
         err = str(e)[:120]
         logger.error(
@@ -287,10 +339,12 @@ def memory_status(session_id: str):
             summarize_error_for_log(err),
             exc_info=True,
         )
-        return {
-            "code": 500,
-            "error_code": "MEMORY_STATUS_ERROR",
-            "session_id": session_id,
-            "error": err,
-            "explanation": common_errors.get("MEMORY_STATUS_ERROR", "会话记忆读取失败"),
-        }
+        return build_error_response(
+            code=500,
+            error_code="MEMORY_STATUS_ERROR",
+            message="会话记忆读取失败",
+            error=err,
+            data={"session_id": session_id},
+            explanation=common_errors.get("MEMORY_STATUS_ERROR", "会话记忆读取失败"),
+            session_id=session_id,
+        )

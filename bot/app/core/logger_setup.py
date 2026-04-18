@@ -9,6 +9,9 @@ from app.core.config import get_env_int, get_env_str, is_prod_runtime
 
 
 _TRACE_ID_CTX: ContextVar[str] = ContextVar("trace_id", default="")
+_REQUEST_ID_CTX: ContextVar[str] = ContextVar("request_id", default="")
+_REQUEST_PATH_CTX: ContextVar[str] = ContextVar("request_path", default="")
+_SESSION_ID_CTX: ContextVar[str] = ContextVar("session_id", default="")
 
 
 def _is_prod_runtime() -> bool:
@@ -132,8 +135,62 @@ def set_trace_id(trace_id: str = "") -> str:
     return value
 
 
+def get_request_id() -> str:
+    return _REQUEST_ID_CTX.get("")
+
+
+def set_request_id(request_id: str = "") -> str:
+    value = (request_id or "").strip()
+    _REQUEST_ID_CTX.set(value)
+    return value
+
+
+def get_request_path() -> str:
+    return _REQUEST_PATH_CTX.get("")
+
+
+def set_request_path(path: str = "") -> str:
+    value = (path or "").strip()
+    _REQUEST_PATH_CTX.set(value)
+    return value
+
+
+def get_session_id() -> str:
+    return _SESSION_ID_CTX.get("")
+
+
+def set_session_id(session_id: str = "") -> str:
+    value = (session_id or "").strip()
+    _SESSION_ID_CTX.set(value)
+    return value
+
+
+def set_observability_context(
+    *,
+    trace_id: str | None = None,
+    request_id: str | None = None,
+    request_path: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    if trace_id is not None:
+        set_trace_id(trace_id)
+    if request_id is not None:
+        set_request_id(request_id)
+    if request_path is not None:
+        set_request_path(request_path)
+    if session_id is not None:
+        set_session_id(session_id)
+
+
 def clear_trace_id() -> None:
     _TRACE_ID_CTX.set("")
+
+
+def clear_observability_context() -> None:
+    clear_trace_id()
+    _REQUEST_ID_CTX.set("")
+    _REQUEST_PATH_CTX.set("")
+    _SESSION_ID_CTX.set("")
 
 
 def log_event(level: int, event: str, **fields) -> None:

@@ -47,12 +47,14 @@ from app.core.gateway_security import (
     log_http_gateway_audit,
 )
 from app.core.logger_setup import (
-    clear_trace_id,
+    clear_observability_context,
     get_trace_id,
     logger,
     log_event,
+    set_observability_context,
     set_trace_id,
 )
+from app.core.monitoring import emit_alert, record_http_request
 from app.api.routers import conversation as conversation_router
 from app.api.routers import ingestion as ingestion_router
 from app.api.routers import ops as ops_router
@@ -210,38 +212,46 @@ _GATEWAY_EXEMPT_PATHS = {
 async def _gateway_guard(request: Request, call_next):
     request_id = _resolve_request_id(request)
     trace_id = _resolve_trace_id(request)
+    path = request.url.path
+    method = request.method.upper()
+    set_observability_context(trace_id=trace_id, request_id=request_id, request_path=path)
+    start = time.perf_counter()
 
     # CORS preflight must pass through auth/rate-limit checks.
     if request.method.upper() == "OPTIONS":
         response = await call_next(request)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        record_http_request(path=path, method=method, status_code=response.status_code, elapsed_ms=elapsed_ms)
         if request_id:
             response.headers["X-Request-Id"] = request_id
         if trace_id:
             response.headers["X-Trace-Id"] = trace_id
-        clear_trace_id()
+        clear_observability_context()
         return response
 
-    path = request.url.path
     if path in _GATEWAY_EXEMPT_PATHS:
         response = await call_next(request)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        record_http_request(path=path, method=method, status_code=response.status_code, elapsed_ms=elapsed_ms)
         if request_id:
             response.headers["X-Request-Id"] = request_id
         if trace_id:
             response.headers["X-Trace-Id"] = trace_id
-        clear_trace_id()
+        clear_observability_context()
         return response
 
     # Keep existing prod 404 behavior for non-exposed routes.
     if _is_prod_runtime() and path not in _PROD_ALLOWED_HTTP_PATHS:
         response = await call_next(request)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        record_http_request(path=path, method=method, status_code=response.status_code, elapsed_ms=elapsed_ms)
         if request_id:
             response.headers["X-Request-Id"] = request_id
         if trace_id:
             response.headers["X-Trace-Id"] = trace_id
-        clear_trace_id()
+        clear_observability_context()
         return response
 
-    start = time.perf_counter()
     auth_scheme = "none"
     audit_ctx = None
     try:
@@ -262,6 +272,8 @@ async def _gateway_guard(request: Request, call_next):
             response = await asyncio.wait_for(call_next(request), timeout=timeout_seconds)
         else:
             response = await call_next(request)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        record_http_request(path=path, method=method, status_code=response.status_code, elapsed_ms=elapsed_ms)
         if audit_ctx is not None:
             response.headers["X-Request-Id"] = audit_ctx.request_id
             if trace_id:
@@ -271,10 +283,12 @@ async def _gateway_guard(request: Request, call_next):
                 "gateway.request",
                 ctx=audit_ctx,
                 status_code=response.status_code,
-                elapsed_ms=int((time.perf_counter() - start) * 1000),
+                elapsed_ms=elapsed_ms,
             )
         return response
     except HTTPException as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        record_http_request(path=path, method=method, status_code=exc.status_code, elapsed_ms=elapsed_ms)
         if audit_ctx is None:
             audit_ctx = build_http_audit_context(
                 request=request,
@@ -286,10 +300,12 @@ async def _gateway_guard(request: Request, call_next):
             "gateway.request.blocked",
             ctx=audit_ctx,
             status_code=exc.status_code,
-            elapsed_ms=int((time.perf_counter() - start) * 1000),
+            elapsed_ms=elapsed_ms,
         )
         raise
     except asyncio.TimeoutError:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        record_http_request(path=path, method=method, status_code=504, elapsed_ms=elapsed_ms)
         if audit_ctx is None:
             audit_ctx = build_http_audit_context(
                 request=request,
@@ -301,7 +317,16 @@ async def _gateway_guard(request: Request, call_next):
             "gateway.request.timeout",
             ctx=audit_ctx,
             status_code=504,
-            elapsed_ms=int((time.perf_counter() - start) * 1000),
+            elapsed_ms=elapsed_ms,
+        )
+        emit_alert(
+            alert_type="gateway_timeout",
+            severity="critical",
+            source="gateway",
+            message="HTTP 网关超时",
+            path=path,
+            method=method,
+            elapsed_ms=elapsed_ms,
         )
         raise HTTPException(
             status_code=504,
@@ -310,8 +335,12 @@ async def _gateway_guard(request: Request, call_next):
                 "error_code": "GATEWAY_TIMEOUT",
             },
         )
+    except Exception:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        record_http_request(path=path, method=method, status_code=500, elapsed_ms=elapsed_ms)
+        raise
     finally:
-        clear_trace_id()
+        clear_observability_context()
 
 
 def _resolve_explanation_by_error_code(error_code: str) -> str:

@@ -13,6 +13,47 @@ def resolve_runtime_dependency(name: str, default: Any) -> Any:
     return getattr(app_main, name, default)
 
 
+def build_success_response(
+    data: Any = None,
+    *,
+    message: str = "请求成功",
+    code: Any = 200,
+    **legacy_fields: Any,
+) -> dict:
+    """构造统一成功响应，并保留历史字段兼容。"""
+    payload = {
+        "ok": True,
+        "code": code,
+        "message": message,
+        "data": data,
+        "error": None,
+    }
+    payload.update(legacy_fields)
+    return payload
+
+
+def build_error_response(
+    *,
+    error_code: str,
+    message: str,
+    error: str = "",
+    data: Any = None,
+    code: Any = 500,
+    **legacy_fields: Any,
+) -> dict:
+    """构造统一失败响应，并保留历史字段兼容。"""
+    payload = {
+        "ok": False,
+        "code": code,
+        "message": message,
+        "data": data,
+        "error": error,
+        "error_code": error_code,
+    }
+    payload.update(legacy_fields)
+    return payload
+
+
 def resolve_add_urls_payload(
     payload: Optional[AddUrlsRequest] = Body(default=None),
     url: Optional[str] = Query(default=None),

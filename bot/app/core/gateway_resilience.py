@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, Optional
 
 from app.core.config import get_env_bool, get_env_float, get_env_int
 from app.core.logger_setup import log_event
+from app.core.monitoring import emit_alert
 import logging
 
 
@@ -97,6 +98,16 @@ class _CircuitBreaker:
                     threshold=settings.failure_threshold,
                     open_seconds=settings.open_seconds,
                     error=str(error)[:180],
+                )
+                emit_alert(
+                    alert_type="circuit_open",
+                    severity="critical",
+                    source=f"gateway.{self.component}",
+                    message="网关熔断开启",
+                    operation=operation,
+                    failure_count=self._failure_count,
+                    threshold=settings.failure_threshold,
+                    open_seconds=settings.open_seconds,
                 )
 
     def execute(self, operation: str, func: Callable[[], Any], fallback: Optional[Callable[[Exception], Any]] = None) -> Any:
