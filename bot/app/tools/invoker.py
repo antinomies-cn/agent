@@ -40,6 +40,28 @@ def validate_tool_payload(tool_obj: Any, payload: dict[str, Any]) -> dict[str, A
     if args_schema is None:
         return _validate_with_signature(tool_obj, payload)
 
+    accepted_fields: set[str] = set()
+    model_fields = getattr(args_schema, "model_fields", None)
+    if isinstance(model_fields, dict):
+        accepted_fields = set(model_fields.keys())
+    else:
+        legacy_fields = getattr(args_schema, "__fields__", None)
+        if isinstance(legacy_fields, dict):
+            accepted_fields = set(legacy_fields.keys())
+
+    if accepted_fields:
+        unexpected_fields = [
+            {
+                "loc": ["body", field],
+                "msg": "unexpected field",
+                "type": "value_error.extra",
+            }
+            for field in payload.keys()
+            if field not in accepted_fields
+        ]
+        if unexpected_fields:
+            raise ToolPayloadValidationError("工具参数校验失败", errors=unexpected_fields)
+
     try:
         return _validate_with_schema(args_schema, payload)
     except Exception as exc:
@@ -57,12 +79,19 @@ def _validate_with_signature(tool_obj: Any, payload: dict[str, Any]) -> dict[str
         return payload
 
     missing_required: list[dict[str, Any]] = []
+    unexpected_fields: list[dict[str, Any]] = []
     normalized_payload = dict(payload)
+    accepted_names: set[str] = set()
+    has_kwargs = False
     for name, param in signature.parameters.items():
         if name == "self":
             continue
-        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
             continue
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            has_kwargs = True
+            continue
+        accepted_names.add(name)
         if param.default is inspect.Parameter.empty and name not in normalized_payload:
             missing_required.append(
                 {
@@ -72,8 +101,19 @@ def _validate_with_signature(tool_obj: Any, payload: dict[str, Any]) -> dict[str
                 }
             )
 
-    if missing_required:
-        raise ToolPayloadValidationError("工具参数校验失败", errors=missing_required)
+    if not has_kwargs:
+        for field in normalized_payload.keys():
+            if field not in accepted_names:
+                unexpected_fields.append(
+                    {
+                        "loc": ["body", field],
+                        "msg": "unexpected field",
+                        "type": "value_error.extra",
+                    }
+                )
+
+    if missing_required or unexpected_fields:
+        raise ToolPayloadValidationError("工具参数校验失败", errors=missing_required + unexpected_fields)
 
     return normalized_payload
 
@@ -91,6 +131,22 @@ def get_tool_args_schema_json(tool_obj: Any) -> dict[str, Any]:
         return _build_schema_from_signature(tool_obj)
 
     return {}
+
+
+def get_tool_contract_summary(tool_obj: Any) -> dict[str, Any]:
+    schema = get_tool_args_schema_json(tool_obj)
+    properties = schema.get("properties") if isinstance(schema, dict) else {}
+    required = schema.get("required") if isinstance(schema, dict) else []
+
+    property_names = list(properties.keys()) if isinstance(properties, dict) else []
+    required_names = [name for name in required if isinstance(name, str)] if isinstance(required, list) else []
+    optional_names = [name for name in property_names if name not in required_names]
+
+    return {
+        "required_fields": required_names,
+        "optional_fields": optional_names,
+        "allow_additional_fields": bool(schema.get("additionalProperties", False)) if isinstance(schema, dict) else False,
+    }
 
 
 def _build_schema_from_signature(tool_obj: Any) -> dict[str, Any]:

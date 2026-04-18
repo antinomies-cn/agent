@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -6,8 +7,21 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from app.core.config import is_prod_runtime
-from app.tools.invoker import ToolPayloadValidationError, get_tool_args_schema_json, get_tool_invoke_policy, invoke_tool
-from app.tools.registry import TOOL_REGISTRY, get_tool, get_tool_metadata
+from app.tools.invoker import (
+    ToolPayloadValidationError,
+    get_tool_args_schema_json,
+    get_tool_contract_summary,
+    get_tool_invoke_policy,
+    invoke_tool,
+)
+from app.tools.registry import (
+    TOOL_REGISTRY,
+    get_effective_intent_tool_names,
+    get_tool,
+    get_tool_debug_access,
+    get_tool_metadata,
+    is_tool_debug_allowed,
+)
 from app.tools.mytools import (
     astro_current_chart,
     astro_day_scope,
@@ -25,6 +39,37 @@ from app.tools.mytools import (
 router = APIRouter()
 _DEBUG_UI_PATH = Path(__file__).resolve().parents[1] / "static" / "debug_ui.html"
 _DEBUG_UI_HTML = _DEBUG_UI_PATH.read_text(encoding="utf-8")
+
+_TOOL_INPUT_EXAMPLES: Dict[str, Dict[str, Any]] = {
+    "test": {"scope": "all"},
+    "search": {"query": "今天的科技新闻"},
+    "vector_search": {"query": "马年生肖的由来"},
+    "xingpan": {
+        "name": "张三",
+        "birth_dt": "1999-10-17 21:00:00",
+        "longitude": 116.4074,
+        "latitude": 39.9042,
+    },
+    "astro_my_sign": {
+        "birth_dt": "1999-10-17 21:00:00",
+        "longitude": 116.4074,
+        "latitude": 39.9042,
+    },
+    "astro_natal_chart": {
+        "birth_dt": "1999-10-17 21:00:00",
+        "longitude": 116.4074,
+        "latitude": 39.9042,
+    },
+    "astro_current_chart": {},
+    "astro_transit_chart": {
+        "birth_dt": "1999-10-17 21:00:00",
+        "longitude": 116.4074,
+        "latitude": 39.9042,
+    },
+    "astro_day_scope": {},
+    "astro_week_scope": {},
+    "astro_month_scope": {},
+}
 
 
 class ToolTestRequest(BaseModel):
@@ -81,6 +126,17 @@ def _invoke_debug_tool(tool_name: str, payload: Dict[str, Any]) -> Dict[str, Any
                 "message": "工具不存在",
                 "error_code": "TOOL_NOT_FOUND",
                 "explanation": f"未找到工具: {tool_name}",
+            },
+        )
+
+    if not is_tool_debug_allowed(tool_name):
+        access = get_tool_debug_access(tool_name)
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "工具当前不允许调试调用",
+                "error_code": "TOOL_ACCESS_DENIED",
+                "explanation": f"tool={tool_name} 的调试权限等级为 {access.get('tier', 'unknown')}，当前策略不允许调用。",
             },
         )
 
@@ -254,10 +310,21 @@ def debug_tool_schema(tool_name: str):
         )
 
     metadata = get_tool_metadata(tool_name)
-    return {
-        "tool": tool_name,
-        "schema": get_tool_args_schema_json(tool_obj),
-        "metadata": {
+    schema = get_tool_args_schema_json(tool_obj)
+    policy = get_tool_invoke_policy(tool_name)
+    runtime_checks = {
+        "env_ready": True,
+        "missing_env": [],
+    }
+    if metadata is not None:
+        missing_env = [name for name in metadata.requires_env if not os.getenv(name, "").strip()]
+        runtime_checks = {
+            "env_ready": len(missing_env) == 0,
+            "missing_env": missing_env,
+        }
+
+    serialized_metadata = (
+        {
             "owner": metadata.owner,
             "version": metadata.version,
             "risk_level": metadata.risk_level,
@@ -265,8 +332,30 @@ def debug_tool_schema(tool_name: str):
             "requires_env": list(metadata.requires_env),
         }
         if metadata is not None
-        else None,
-        "policy": get_tool_invoke_policy(tool_name),
+        else None
+    )
+
+    grouped_data = {
+        "input_schema": schema,
+        "input_example": _TOOL_INPUT_EXAMPLES.get(tool_name, {}),
+        "parameter_contract": get_tool_contract_summary(tool_obj),
+        "tool_metadata": serialized_metadata,
+        "debug_access": get_tool_debug_access(tool_name),
+        "effective_policy": policy,
+        "runtime_checks": runtime_checks,
+    }
+
+    return {
+        "ok": True,
+        "tool": tool_name,
+        "data": grouped_data,
+        # backward compatibility
+        "schema": schema,
+        "input_example": _TOOL_INPUT_EXAMPLES.get(tool_name, {}),
+        "contract": get_tool_contract_summary(tool_obj),
+        "metadata": serialized_metadata,
+        "debug_access": get_tool_debug_access(tool_name),
+        "policy": policy,
     }
 
 
@@ -281,6 +370,8 @@ def debug_tool_catalog():
             {
                 "tool": tool_name,
                 "schema": get_tool_args_schema_json(tool_obj),
+                "input_example": _TOOL_INPUT_EXAMPLES.get(tool_name, {}),
+                "contract": get_tool_contract_summary(tool_obj),
                 "metadata": {
                     "owner": metadata.owner,
                     "version": metadata.version,
@@ -290,12 +381,54 @@ def debug_tool_catalog():
                 }
                 if metadata is not None
                 else None,
+                "debug_access": get_tool_debug_access(tool_name),
                 "policy": get_tool_invoke_policy(tool_name),
             }
         )
 
     return {
         "count": len(items),
+        "intent_mapping": get_effective_intent_tool_names(),
+        "items": sorted(items, key=lambda one: one.get("tool", "")),
+    }
+
+
+@router.get("/tools/health", summary="工具调试：健康聚合", description="聚合全部工具的可用性、权限和配置健康状态（仅开发环境）。")
+def debug_tools_health():
+    _ensure_debug_tools_enabled()
+
+    items = []
+    for tool_name, tool_obj in TOOL_REGISTRY.items():
+        metadata = get_tool_metadata(tool_name)
+        access = get_tool_debug_access(tool_name)
+        schema = get_tool_args_schema_json(tool_obj)
+        policy = get_tool_invoke_policy(tool_name)
+
+        missing_env: list[str] = []
+        if metadata is not None:
+            missing_env = [name for name in metadata.requires_env if not os.getenv(name, "").strip()]
+
+        items.append(
+            {
+                "tool": tool_name,
+                "debug_allowed": bool(access.get("allowed", False)),
+                "debug_tier": access.get("tier", "public"),
+                "schema_ready": isinstance(schema, dict),
+                "env_ready": len(missing_env) == 0,
+                "missing_env": missing_env,
+                "metadata_ready": metadata is not None,
+                "policy": policy,
+            }
+        )
+
+    ok_count = sum(1 for item in items if item["env_ready"] and item["schema_ready"] and item["metadata_ready"])
+    return {
+        "ok": ok_count == len(items),
+        "summary": {
+            "total": len(items),
+            "healthy": ok_count,
+            "unhealthy": len(items) - ok_count,
+        },
         "items": sorted(items, key=lambda one: one.get("tool", "")),
     }
 

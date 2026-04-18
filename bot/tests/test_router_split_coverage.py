@@ -100,6 +100,15 @@ def test_tools_invoke_endpoint_returns_validation_error_for_bad_payload():
     assert body["error"]["errors"]
 
 
+def test_tools_invoke_endpoint_rejects_unexpected_field():
+    client = TestClient(main.app)
+    resp = client.post("/tools/invoke/search", json={"query": "hello", "unexpected": "x"})
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error_code"] == "REQUEST_VALIDATION_ERROR"
+
+
 def test_tools_invoke_endpoint_returns_tool_timeout(monkeypatch):
     monkeypatch.setenv("TOOL_SEARCH_TIMEOUT_SECONDS", "0.01")
     monkeypatch.setenv("TOOL_SEARCH_RETRY_COUNT", "0")
@@ -129,18 +138,42 @@ def test_tools_invoke_endpoint_returns_tool_exec_error(monkeypatch):
     assert body["code"] == "TOOL_EXEC_ERROR"
 
 
+def test_tools_invoke_endpoint_blocks_protected_tool_when_disabled(monkeypatch):
+    monkeypatch.setenv("TOOL_DEBUG_ALLOW_PROTECTED", "false")
+
+    client = TestClient(main.app)
+    resp = client.post("/tools/invoke/astro_current_chart", json={})
+
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["error_code"] == "TOOL_ACCESS_DENIED"
+
+
 def test_tools_schema_endpoint_returns_args_schema():
     client = TestClient(main.app)
     resp = client.get("/tools/schema/search")
 
     assert resp.status_code == 200
     body = resp.json()
+    assert body["ok"] is True
     assert body["tool"] == "search"
     assert isinstance(body["schema"], dict)
     assert body["metadata"]["owner"] == "platform"
     assert body["metadata"]["risk_level"] == "medium"
     assert body["policy"]["timeout_seconds"] > 0
     assert body["policy"]["retry_count"] >= 0
+    assert body["input_example"]["query"] == "今天的科技新闻"
+    assert body["debug_access"]["tier"] == "public"
+    assert isinstance(body["contract"]["required_fields"], list)
+
+    # clearer grouped fields
+    assert isinstance(body["data"]["input_schema"], dict)
+    assert body["data"]["input_example"]["query"] == "今天的科技新闻"
+    assert isinstance(body["data"]["parameter_contract"]["required_fields"], list)
+    assert body["data"]["tool_metadata"]["owner"] == "platform"
+    assert body["data"]["debug_access"]["tier"] == "public"
+    assert body["data"]["effective_policy"]["timeout_seconds"] > 0
+    assert isinstance(body["data"]["runtime_checks"]["missing_env"], list)
 
 
 def test_tools_catalog_endpoint_returns_items():
@@ -154,8 +187,34 @@ def test_tools_catalog_endpoint_returns_items():
     search_item = next((item for item in body["items"] if item.get("tool") == "search"), None)
     assert search_item is not None
     assert isinstance(search_item.get("schema"), dict)
+    assert search_item["input_example"]["query"] == "今天的科技新闻"
     assert search_item["metadata"]["owner"] == "platform"
+    assert isinstance(search_item["contract"]["required_fields"], list)
+    assert search_item["debug_access"]["tier"] == "public"
     assert search_item["policy"]["timeout_seconds"] > 0
+    assert isinstance(body["intent_mapping"], dict)
+
+
+def test_tools_catalog_exposes_env_overridden_intent_mapping(monkeypatch):
+    monkeypatch.setenv("INTENT_TOOL_MAPPING_JSON", '{"search":["search"]}')
+
+    client = TestClient(main.app)
+    resp = client.get("/tools/catalog")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent_mapping"]["search"] == ["search"]
+
+
+def test_tools_health_endpoint_returns_summary():
+    client = TestClient(main.app)
+    resp = client.get("/tools/health")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body["ok"], bool)
+    assert body["summary"]["total"] >= 1
+    assert isinstance(body["items"], list)
 
 
 def test_tools_legacy_routes_marked_deprecated_in_openapi():
