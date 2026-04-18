@@ -9,7 +9,7 @@ import uuid
 import requests
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -26,7 +26,6 @@ if __package__ in (None, ""):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from app.core.embedding_config import resolve_embedding_config
 from app.core.config import (
     build_config_health_summary,
     get_env_float,
@@ -54,7 +53,6 @@ from app.core.logger_setup import (
     log_event,
     set_trace_id,
 )
-from app.core.litellm_adapters import build_litellm_embeddings_client
 from app.api.routers import conversation as conversation_router
 from app.api.routers import ingestion as ingestion_router
 from app.api.routers import ops as ops_router
@@ -440,38 +438,6 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
         request_id=getattr(request.state, "request_id", ""),
         trace_id=getattr(request.state, "trace_id", "") or get_trace_id(),
     )
-
-
-def _resolve_add_urls_payload(
-    payload: Optional[AddUrlsRequest] = Body(default=None),
-    url: Optional[str] = Query(default=None),
-    urls: Optional[List[str]] = Query(default=None),
-    chunk_strategy: Optional[Literal["balanced", "faq", "article", "custom"]] = Query(default=None),
-    chunk_size: Optional[int] = Query(default=None, ge=100, le=4000),
-    chunk_overlap: Optional[int] = Query(default=None, ge=0, le=1000),
-    separators: Optional[List[str]] = Query(default=None),
-    preview_limit: Optional[int] = Query(default=None, ge=1, le=20),
-) -> AddUrlsRequest:
-    """统一接收JSON与Query参数，归一成 AddUrlsRequest。"""
-    data = payload.model_dump() if payload is not None else {}
-
-    existing_url = data.get("url")
-    if url is not None and (existing_url is None or (isinstance(existing_url, str) and not existing_url.strip())):
-        data["url"] = url
-    if urls is not None and ("urls" not in data or not data.get("urls")):
-        data["urls"] = urls
-    if chunk_strategy is not None and data.get("chunk_strategy") is None:
-        data["chunk_strategy"] = chunk_strategy
-    if chunk_size is not None and data.get("chunk_size") is None:
-        data["chunk_size"] = chunk_size
-    if chunk_overlap is not None and data.get("chunk_overlap") is None:
-        data["chunk_overlap"] = chunk_overlap
-    if separators is not None and data.get("separators") is None:
-        data["separators"] = separators
-    if preview_limit is not None and data.get("preview_limit") is None:
-        data["preview_limit"] = preview_limit
-
-    return AddUrlsRequest(**data)
 
 
 def _build_chunking_config(
@@ -1049,12 +1015,6 @@ def _ensure_qdrant_collection(client: QdrantClient, collection_name: str, vector
         distance.name,
     )
     return vector_size
-
-
-def _build_embeddings_client(vector_size: int):
-    """统一走 LiteLLM embeddings 模型（默认 bge-m3）。"""
-    embedding_cfg = resolve_embedding_config(default_dimension=vector_size)
-    return build_litellm_embeddings_client(default_dimensions=embedding_cfg.dimensions)
 
 
 # 兼容导出说明：

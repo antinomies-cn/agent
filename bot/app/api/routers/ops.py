@@ -5,6 +5,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.api.deps import resolve_runtime_dependency
 from app.core.config import build_config_health_summary, get_qdrant_settings, get_rerank_gateway_settings
 from app.core.embedding_config import resolve_embedding_config
 from app.core.gateway_resilience import get_resilience_snapshot
@@ -40,16 +41,6 @@ class CircuitBreakerStatusItem(BaseModel):
     failure_threshold: int = Field(description="触发熔断的失败阈值")
     open_seconds: float = Field(description="熔断开启持续时间")
     retry_after_seconds: float = Field(description="距离可重试的剩余秒数")
-
-
-def _resolve_runtime_dependency(name: str, default):
-    try:
-        from app import main as app_main
-    except Exception:
-        return default
-    return getattr(app_main, name, default)
-
-
 def _ops_error(code: str, err: str) -> dict:
     messages = {
         "QDRANT_INIT_ERROR": "Qdrant 初始化失败，请检查连接、鉴权与集合配置。",
@@ -75,7 +66,7 @@ def init_qdrant(
     collection: Optional[str] = Query(default=None, description="可选：指定要初始化的collection，默认使用QDRANT_COLLECTION"),
     recreate: bool = Query(default=False, description="是否先删除旧集合再重建"),
 ):
-    init_qdrant_collection = _resolve_runtime_dependency("init_qdrant_collection", None)
+    init_qdrant_collection = resolve_runtime_dependency("init_qdrant_collection", None)
 
     try:
         if init_qdrant_collection is None:
@@ -94,7 +85,7 @@ def init_qdrant(
 def recreate_qdrant(
     collection: Optional[str] = Query(default=None, description="可选：指定要重建的collection，默认使用QDRANT_COLLECTION"),
 ):
-    recreate_qdrant_collection = _resolve_runtime_dependency("recreate_qdrant_collection", None)
+    recreate_qdrant_collection = resolve_runtime_dependency("recreate_qdrant_collection", None)
 
     target = (collection or get_qdrant_settings().collection).strip()
     try:
@@ -108,7 +99,7 @@ def recreate_qdrant(
 
 @router.get("/qdrant/health", summary="Qdrant健康检查", description="检查Qdrant连通性与可用性。")
 def qdrant_health_check():
-    qdrant_health = _resolve_runtime_dependency("qdrant_health", None)
+    qdrant_health = resolve_runtime_dependency("qdrant_health", None)
 
     try:
         if qdrant_health is None:
@@ -121,7 +112,7 @@ def qdrant_health_check():
 
 @router.get("/qdrant/collections", summary="Qdrant集合列表", description="列出当前Qdrant中的集合。")
 def qdrant_collections():
-    qdrant_list_collections = _resolve_runtime_dependency("qdrant_list_collections", None)
+    qdrant_list_collections = resolve_runtime_dependency("qdrant_list_collections", None)
 
     try:
         if qdrant_list_collections is None:
@@ -134,7 +125,7 @@ def qdrant_collections():
 
 @router.get("/qdrant/status", summary="Qdrant状态", description="获取Qdrant仓库的轻量状态信息。")
 def qdrant_status():
-    qdrant_repo_status = _resolve_runtime_dependency("qdrant_repo_status", None)
+    qdrant_repo_status = resolve_runtime_dependency("qdrant_repo_status", None)
 
     try:
         if qdrant_repo_status is None:
@@ -210,9 +201,9 @@ def gateway_resilience_status():
 
 @router.get("/health", summary="服务健康检查", description="检查服务与LLM连通性，返回运行状态。")
 async def health_check():
-    master = _resolve_runtime_dependency("master", None)
-    is_prod_runtime = _resolve_runtime_dependency("_is_prod_runtime", lambda: False)
-    common_errors = _resolve_runtime_dependency("_COMMON_ERROR_EXPLANATIONS", {})
+    master = resolve_runtime_dependency("master", None)
+    is_prod_runtime = resolve_runtime_dependency("_is_prod_runtime", lambda: False)
+    common_errors = resolve_runtime_dependency("_COMMON_ERROR_EXPLANATIONS", {})
 
     if master is None:
         return {
@@ -247,7 +238,7 @@ async def health_check():
 
 @router.get("/health/live", summary="服务存活检查", description="轻量存活检查，不依赖LLM。")
 def health_live():
-    is_prod_runtime = _resolve_runtime_dependency("_is_prod_runtime", lambda: False)
+    is_prod_runtime = resolve_runtime_dependency("_is_prod_runtime", lambda: False)
 
     return {
         "status": "healthy",
@@ -258,8 +249,8 @@ def health_live():
 
 @router.get("/memory/status", summary="会话记忆状态", description="按 session_id 查询会话记忆状态。")
 def memory_status(session_id: str):
-    master = _resolve_runtime_dependency("master", None)
-    common_errors = _resolve_runtime_dependency("_COMMON_ERROR_EXPLANATIONS", {})
+    master = resolve_runtime_dependency("master", None)
+    common_errors = resolve_runtime_dependency("_COMMON_ERROR_EXPLANATIONS", {})
 
     if not session_id.strip():
         raise HTTPException(

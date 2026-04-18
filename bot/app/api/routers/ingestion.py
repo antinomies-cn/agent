@@ -6,6 +6,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from langchain_community.vectorstores import Qdrant
 from qdrant_client import QdrantClient
 
+from app.api.deps import resolve_add_urls_payload, resolve_runtime_dependency
 from app.core.config import get_qdrant_settings
 from app.core.embedding_config import resolve_embedding_config
 from app.core.gateway_resilience import CircuitOpenError, resilience_execute
@@ -23,46 +24,6 @@ from app.services import add_urls_service
 router = APIRouter()
 
 
-def _resolve_runtime_dependency(name: str, default: Any) -> Any:
-    """兼容测试中的 monkeypatch(main.xxx) 路径。"""
-    try:
-        from app import main as app_main
-    except Exception:
-        return default
-    return getattr(app_main, name, default)
-
-
-def _resolve_add_urls_payload(
-    payload: Optional[AddUrlsRequest] = Body(default=None),
-    url: Optional[str] = Query(default=None),
-    urls: Optional[List[str]] = Query(default=None),
-    chunk_strategy: Optional[Literal["balanced", "faq", "article", "custom"]] = Query(default=None),
-    chunk_size: Optional[int] = Query(default=None, ge=100, le=4000),
-    chunk_overlap: Optional[int] = Query(default=None, ge=0, le=1000),
-    separators: Optional[List[str]] = Query(default=None),
-    preview_limit: Optional[int] = Query(default=None, ge=1, le=20),
-) -> AddUrlsRequest:
-    data = payload.model_dump() if payload is not None else {}
-
-    existing_url = data.get("url")
-    if url is not None and (existing_url is None or (isinstance(existing_url, str) and not existing_url.strip())):
-        data["url"] = url
-    if urls is not None and ("urls" not in data or not data.get("urls")):
-        data["urls"] = urls
-    if chunk_strategy is not None and data.get("chunk_strategy") is None:
-        data["chunk_strategy"] = chunk_strategy
-    if chunk_size is not None and data.get("chunk_size") is None:
-        data["chunk_size"] = chunk_size
-    if chunk_overlap is not None and data.get("chunk_overlap") is None:
-        data["chunk_overlap"] = chunk_overlap
-    if separators is not None and data.get("separators") is None:
-        data["separators"] = separators
-    if preview_limit is not None and data.get("preview_limit") is None:
-        data["preview_limit"] = preview_limit
-
-    return AddUrlsRequest(**data)
-
-
 def _dep(name: str) -> Callable[..., Any]:
     mapping = {
         "_ensure_add_urls_write_enabled": add_urls_service._ensure_add_urls_write_enabled,
@@ -78,12 +39,12 @@ def _dep(name: str) -> Callable[..., Any]:
         "_is_vector_dim_mismatch_error": add_urls_service._is_vector_dim_mismatch_error,
     }
     if name == "VectorSizeMismatchError":
-        return _resolve_runtime_dependency(name, add_urls_service.VectorSizeMismatchError)
+        return resolve_runtime_dependency(name, add_urls_service.VectorSizeMismatchError)
     if name == "QdrantClient":
-        return _resolve_runtime_dependency(name, QdrantClient)
+        return resolve_runtime_dependency(name, QdrantClient)
     if name == "Qdrant":
-        return _resolve_runtime_dependency(name, Qdrant)
-    return _resolve_runtime_dependency(name, mapping[name])
+        return resolve_runtime_dependency(name, Qdrant)
+    return resolve_runtime_dependency(name, mapping[name])
 
 
 @router.post(
@@ -93,7 +54,7 @@ def _dep(name: str) -> Callable[..., Any]:
     description="抓取URL内容、切块并写入向量库。支持 JSON 与 Query 参数。",
 )
 def add_urls(
-    payload: AddUrlsRequest = Depends(_resolve_add_urls_payload),
+    payload: AddUrlsRequest = Depends(resolve_add_urls_payload),
 ):
     ensure_write_enabled = _dep("_ensure_add_urls_write_enabled")
     normalize_urls = _dep("_normalize_urls")
@@ -263,7 +224,7 @@ def add_urls(
     description="仅抓取与切块预览，不写入向量库。支持 JSON 与 Query 参数。",
 )
 def add_urls_dry_run(
-    payload: AddUrlsRequest = Depends(_resolve_add_urls_payload),
+    payload: AddUrlsRequest = Depends(resolve_add_urls_payload),
 ):
     normalize_urls = _dep("_normalize_urls")
     partition_safe_urls = _dep("_partition_safe_urls")

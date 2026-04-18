@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 
+from app.api.deps import resolve_runtime_dependency
 from app.core.logger_setup import logger, log_event, mask_session_id, summarize_error_for_log, summarize_text_for_log
 from app.core.texts import USER_MESSAGES
 
@@ -16,21 +17,13 @@ def read_root():
     return {"Hello": "World"}
 
 
-def _resolve_runtime_dependency(name: str, default: Any) -> Any:
-    try:
-        from app import main as app_main
-    except Exception:
-        return default
-    return getattr(app_main, name, default)
-
-
 @router.post("/chat", summary="对话接口", description="主对话入口。query 为用户输入，session_id 用于会话隔离。")
 def chat(
     query: str = Query(...),
     session_id: str = Query(...),
 ):
-    common_errors = _resolve_runtime_dependency("_COMMON_ERROR_EXPLANATIONS", {})
-    master = _resolve_runtime_dependency("master", None)
+    common_errors = resolve_runtime_dependency("_COMMON_ERROR_EXPLANATIONS", {})
+    master = resolve_runtime_dependency("master", None)
 
     logger.info(
         "接收Chat API请求 | session_id: %s | query: %s",
@@ -82,12 +75,12 @@ def chat(
 
 @router.websocket("/ws")
 async def ws(websocket: WebSocket):
-    is_prod_runtime = _resolve_runtime_dependency("_is_prod_runtime", lambda: False)
-    ensure_websocket_auth = _resolve_runtime_dependency("ensure_websocket_auth", None)
-    ensure_ws_rate_limit = _resolve_runtime_dependency("ensure_ws_rate_limit", None)
-    gateway_security_settings = _resolve_runtime_dependency("gateway_security_settings", None)
-    gateway_rate_limiter = _resolve_runtime_dependency("gateway_rate_limiter", None)
-    master = _resolve_runtime_dependency("master", None)
+    is_prod_runtime = resolve_runtime_dependency("_is_prod_runtime", lambda: False)
+    ensure_websocket_auth = resolve_runtime_dependency("ensure_websocket_auth", None)
+    ensure_ws_rate_limit = resolve_runtime_dependency("ensure_ws_rate_limit", None)
+    gateway_security_settings = resolve_runtime_dependency("gateway_security_settings", None)
+    gateway_rate_limiter = resolve_runtime_dependency("gateway_rate_limiter", None)
+    master = resolve_runtime_dependency("master", None)
 
     if is_prod_runtime():
         await websocket.close(code=1008, reason="Not Found")
