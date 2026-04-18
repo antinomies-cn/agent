@@ -137,6 +137,25 @@ def test_tools_schema_endpoint_returns_args_schema():
     body = resp.json()
     assert body["tool"] == "search"
     assert isinstance(body["schema"], dict)
+    assert body["metadata"]["owner"] == "platform"
+    assert body["metadata"]["risk_level"] == "medium"
+    assert body["policy"]["timeout_seconds"] > 0
+    assert body["policy"]["retry_count"] >= 0
+
+
+def test_tools_catalog_endpoint_returns_items():
+    client = TestClient(main.app)
+    resp = client.get("/tools/catalog")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] >= 1
+    assert isinstance(body["items"], list)
+    search_item = next((item for item in body["items"] if item.get("tool") == "search"), None)
+    assert search_item is not None
+    assert isinstance(search_item.get("schema"), dict)
+    assert search_item["metadata"]["owner"] == "platform"
+    assert search_item["policy"]["timeout_seconds"] > 0
 
 
 def test_tools_legacy_routes_marked_deprecated_in_openapi():

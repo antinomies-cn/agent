@@ -6,8 +6,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from app.core.config import is_prod_runtime
-from app.tools.invoker import ToolPayloadValidationError, get_tool_args_schema_json, invoke_tool
-from app.tools.registry import get_tool
+from app.tools.invoker import ToolPayloadValidationError, get_tool_args_schema_json, get_tool_invoke_policy, invoke_tool
+from app.tools.registry import TOOL_REGISTRY, get_tool, get_tool_metadata
 from app.tools.mytools import (
     astro_current_chart,
     astro_day_scope,
@@ -253,9 +253,50 @@ def debug_tool_schema(tool_name: str):
             },
         )
 
+    metadata = get_tool_metadata(tool_name)
     return {
         "tool": tool_name,
         "schema": get_tool_args_schema_json(tool_obj),
+        "metadata": {
+            "owner": metadata.owner,
+            "version": metadata.version,
+            "risk_level": metadata.risk_level,
+            "idempotent": metadata.idempotent,
+            "requires_env": list(metadata.requires_env),
+        }
+        if metadata is not None
+        else None,
+        "policy": get_tool_invoke_policy(tool_name),
+    }
+
+
+@router.get("/tools/catalog", summary="工具调试：工具目录", description="查看全部工具的参数Schema、元数据与生效策略（仅开发环境）。")
+def debug_tool_catalog():
+    _ensure_debug_tools_enabled()
+
+    items = []
+    for tool_name, tool_obj in TOOL_REGISTRY.items():
+        metadata = get_tool_metadata(tool_name)
+        items.append(
+            {
+                "tool": tool_name,
+                "schema": get_tool_args_schema_json(tool_obj),
+                "metadata": {
+                    "owner": metadata.owner,
+                    "version": metadata.version,
+                    "risk_level": metadata.risk_level,
+                    "idempotent": metadata.idempotent,
+                    "requires_env": list(metadata.requires_env),
+                }
+                if metadata is not None
+                else None,
+                "policy": get_tool_invoke_policy(tool_name),
+            }
+        )
+
+    return {
+        "count": len(items),
+        "items": sorted(items, key=lambda one: one.get("tool", "")),
     }
 
 

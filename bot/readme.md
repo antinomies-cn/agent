@@ -77,6 +77,7 @@
 | /qdrant/status | GET | Qdrant 仓库状态（轻量监视） |
 | /tools/invoke/{tool_name} | POST | 调试工具统一调用入口（仅开发环境） |
 | /tools/schema/{tool_name} | GET | 调试工具参数Schema（仅开发环境） |
+| /tools/catalog | GET | 调试工具目录（schema+metadata+policy，仅开发环境） |
 
 说明：当 ENV=prod 时，仅暴露 /chat；其余 HTTP/WebSocket 接口返回 Not Found。
 
@@ -85,8 +86,9 @@
 1. 推荐使用统一入口 `POST /tools/invoke/{tool_name}`，请求体为该工具所需参数。
 2. 旧调试路由（如 `/tools/search`、`/tools/vector_search`）继续兼容，可逐步迁移到统一入口。
 3. 统一入口会按工具参数模型做请求体校验，校验失败返回 `REQUEST_VALIDATION_ERROR`。
-4. 可通过 `GET /tools/schema/{tool_name}` 查看工具参数结构，便于前端/脚本构造请求。
+4. 可通过 `GET /tools/schema/{tool_name}` 查看工具参数结构、元数据与生效策略（timeout/retry），便于前端/脚本构造请求。
 5. 旧工具调试路由已标记为 deprecated，请优先迁移到 `/tools/invoke/{tool_name}`。
+6. 可通过 `GET /tools/catalog` 一次性拉取全部工具目录，用于调试台渲染和巡检。
 
 ### add_urls 输入示例（支持 Query 与 JSON）
 

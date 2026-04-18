@@ -80,14 +80,12 @@ def _validate_with_signature(tool_obj: Any, payload: dict[str, Any]) -> dict[str
 
 def get_tool_args_schema_json(tool_obj: Any) -> dict[str, Any]:
     args_schema = getattr(tool_obj, "args_schema", None)
-    if args_schema is None:
-        return {}
+    if args_schema is not None:
+        if hasattr(args_schema, "model_json_schema"):
+            return args_schema.model_json_schema()
 
-    if hasattr(args_schema, "model_json_schema"):
-        return args_schema.model_json_schema()
-
-    if hasattr(args_schema, "schema"):
-        return args_schema.schema()
+        if hasattr(args_schema, "schema"):
+            return args_schema.schema()
 
     if callable(tool_obj):
         return _build_schema_from_signature(tool_obj)
@@ -163,6 +161,14 @@ def _resolve_invoke_policy(tool_name: str) -> tuple[float, int]:
     timeout = get_env_float(f"TOOL_{suffix}_TIMEOUT_SECONDS", default=default_timeout, min_value=0.01)
     retry_count = get_env_int(f"TOOL_{suffix}_RETRY_COUNT", default=default_retry, min_value=0)
     return timeout, retry_count
+
+
+def get_tool_invoke_policy(tool_name: str) -> dict[str, Any]:
+    timeout_seconds, retry_count = _resolve_invoke_policy(tool_name)
+    return {
+        "timeout_seconds": timeout_seconds,
+        "retry_count": retry_count,
+    }
 
 
 def _execute_once(tool_obj: Any, payload: dict[str, Any], timeout_seconds: float) -> Any:
