@@ -8,9 +8,11 @@ from app.tools.invoker import (
 from app.tools.registry import (
     ASTRO_TOOL_NAMES,
     INTENT_TOOL_NAMES,
+    TOOL_METADATA,
     TOOL_REGISTRY,
     get_all_tools,
     get_tool,
+    get_tool_metadata,
     get_tools_by_names,
     get_tools_for_intent,
 )
@@ -18,9 +20,11 @@ from app.tools.registry import (
 __all__ = [
     "ASTRO_TOOL_NAMES",
     "INTENT_TOOL_NAMES",
+    "TOOL_METADATA",
     "TOOL_REGISTRY",
     "get_all_tools",
     "get_tool",
+    "get_tool_metadata",
     "get_tools_by_names",
     "get_tools_for_intent",
     "ToolPayloadValidationError",

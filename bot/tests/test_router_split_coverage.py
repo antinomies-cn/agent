@@ -16,6 +16,22 @@ class _Invoker:
         return self._result
 
 
+class _TimeoutInvoker:
+    def __init__(self, sleep_seconds):
+        self._sleep_seconds = sleep_seconds
+
+    def invoke(self, payload):
+        import time
+
+        time.sleep(self._sleep_seconds)
+        return "late"
+
+
+class _ErrorInvoker:
+    def invoke(self, payload):
+        raise RuntimeError("boom")
+
+
 def test_tools_endpoint_wraps_structured_error_payload(monkeypatch):
     monkeypatch.setattr(
         tools_router,
@@ -82,6 +98,35 @@ def test_tools_invoke_endpoint_returns_validation_error_for_bad_payload():
     body = resp.json()
     assert body["error_code"] == "REQUEST_VALIDATION_ERROR"
     assert body["error"]["errors"]
+
+
+def test_tools_invoke_endpoint_returns_tool_timeout(monkeypatch):
+    monkeypatch.setenv("TOOL_SEARCH_TIMEOUT_SECONDS", "0.01")
+    monkeypatch.setenv("TOOL_SEARCH_RETRY_COUNT", "0")
+    monkeypatch.setattr(tools_router, "search", _TimeoutInvoker(0.05))
+
+    client = TestClient(main.app)
+    resp = client.post("/tools/invoke/search", json={"query": "hello"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tool"] == "search"
+    assert body["ok"] is False
+    assert body["code"] == "TOOL_TIMEOUT"
+
+
+def test_tools_invoke_endpoint_returns_tool_exec_error(monkeypatch):
+    monkeypatch.setenv("TOOL_SEARCH_RETRY_COUNT", "0")
+    monkeypatch.setattr(tools_router, "search", _ErrorInvoker())
+
+    client = TestClient(main.app)
+    resp = client.post("/tools/invoke/search", json={"query": "hello"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tool"] == "search"
+    assert body["ok"] is False
+    assert body["code"] == "TOOL_EXEC_ERROR"
 
 
 def test_tools_schema_endpoint_returns_args_schema():

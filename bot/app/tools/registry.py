@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from app.tools.mytools import (
@@ -50,8 +51,124 @@ ASTRO_TOOL_NAMES = {
 }
 
 
+@dataclass(frozen=True)
+class ToolMeta:
+    owner: str
+    version: str
+    risk_level: str
+    idempotent: bool
+    timeout_seconds: float
+    retry_count: int
+    requires_env: tuple[str, ...] = ()
+
+
+TOOL_METADATA: dict[str, ToolMeta] = {
+    "search": ToolMeta(
+        owner="platform",
+        version="1.0",
+        risk_level="medium",
+        idempotent=True,
+        timeout_seconds=8.0,
+        retry_count=1,
+        requires_env=("SERPAPI_API_KEY",),
+    ),
+    "test": ToolMeta(
+        owner="platform",
+        version="1.0",
+        risk_level="low",
+        idempotent=True,
+        timeout_seconds=6.0,
+        retry_count=0,
+    ),
+    "vector_search": ToolMeta(
+        owner="platform",
+        version="1.0",
+        risk_level="medium",
+        idempotent=True,
+        timeout_seconds=10.0,
+        retry_count=1,
+    ),
+    "xingpan": ToolMeta(
+        owner="astro",
+        version="1.0",
+        risk_level="high",
+        idempotent=True,
+        timeout_seconds=15.0,
+        retry_count=1,
+        requires_env=("XINGPAN_APP_ID", "XINGPAN_APP_KEY"),
+    ),
+    "astro_my_sign": ToolMeta(
+        owner="astro",
+        version="1.0",
+        risk_level="high",
+        idempotent=True,
+        timeout_seconds=15.0,
+        retry_count=1,
+        requires_env=("XINGPAN_APP_ID", "XINGPAN_APP_KEY", "ASTRO_UID"),
+    ),
+    "astro_natal_chart": ToolMeta(
+        owner="astro",
+        version="1.0",
+        risk_level="high",
+        idempotent=True,
+        timeout_seconds=15.0,
+        retry_count=1,
+        requires_env=("XINGPAN_APP_ID", "XINGPAN_APP_KEY"),
+    ),
+    "astro_current_chart": ToolMeta(
+        owner="astro",
+        version="1.0",
+        risk_level="high",
+        idempotent=True,
+        timeout_seconds=15.0,
+        retry_count=1,
+        requires_env=("XINGPAN_APP_ID", "XINGPAN_APP_KEY"),
+    ),
+    "astro_transit_chart": ToolMeta(
+        owner="astro",
+        version="1.0",
+        risk_level="high",
+        idempotent=True,
+        timeout_seconds=15.0,
+        retry_count=1,
+        requires_env=("XINGPAN_APP_ID", "XINGPAN_APP_KEY"),
+    ),
+    "astro_day_scope": ToolMeta(
+        owner="astro",
+        version="1.0",
+        risk_level="medium",
+        idempotent=True,
+        timeout_seconds=15.0,
+        retry_count=1,
+        requires_env=("XINGPAN_APP_ID", "XINGPAN_APP_KEY", "ASTRO_UID"),
+    ),
+    "astro_week_scope": ToolMeta(
+        owner="astro",
+        version="1.0",
+        risk_level="medium",
+        idempotent=True,
+        timeout_seconds=15.0,
+        retry_count=1,
+        requires_env=("XINGPAN_APP_ID", "XINGPAN_APP_KEY", "ASTRO_UID"),
+    ),
+    "astro_month_scope": ToolMeta(
+        owner="astro",
+        version="1.0",
+        risk_level="medium",
+        idempotent=True,
+        timeout_seconds=15.0,
+        retry_count=1,
+        requires_env=("XINGPAN_APP_ID", "XINGPAN_APP_KEY", "ASTRO_UID"),
+    ),
+}
+
+
 def get_tool(tool_name: str):
     return TOOL_REGISTRY.get((tool_name or "").strip())
+
+
+def get_tool_metadata(tool_name: str) -> ToolMeta | None:
+    return TOOL_METADATA.get((tool_name or "").strip())
 
 
 def get_tools_by_names(tool_names: list[str]) -> list[Any]:
