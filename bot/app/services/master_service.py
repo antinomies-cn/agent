@@ -11,16 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import ChatMessageHistory as InMemoryChatMessageHistory
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 
-from app.tools.mytools import (
-    astro_current_chart,
-    astro_my_sign,
-    astro_natal_chart,
-    astro_transit_chart,
-    search,
-    test,
-    vector_search,
-    xingpan,
-)
+from app.tools.registry import ASTRO_TOOL_NAMES, get_all_tools, get_tools_for_intent
 from app.core.config import (
     IS_PROD,
     get_env_float,
@@ -64,16 +55,7 @@ class Master:
             max_tokens=12,
         )
 
-        self.all_tools = [
-            search,
-            test,
-            vector_search,
-            xingpan,
-            astro_my_sign,
-            astro_natal_chart,
-            astro_current_chart,
-            astro_transit_chart,
-        ]
+        self.all_tools = get_all_tools()
 
         self.redis_url = self._build_redis_url_from_env()
         self.memory_ttl = get_env_int("MEMORY_TTL", default=86400, min_value=60)
@@ -350,16 +332,7 @@ class Master:
 
     def _select_tools_by_intent(self, query: str, intent: str | None = None):
         intent = intent or self._route_intent(query)
-        map_tools = {
-            "astro_my_sign": [astro_my_sign, test, search],
-            "astro_natal_chart": [astro_natal_chart, xingpan, test, search],
-            "astro_current_chart": [astro_current_chart, test, search],
-            "astro_transit_chart": [astro_transit_chart, xingpan, test, search],
-            "xingpan": [xingpan, astro_natal_chart, astro_transit_chart, test, search],
-            "vector_search": [vector_search, search, test],
-            "search": [search, vector_search, test],
-        }
-        selected = map_tools.get(intent, self.all_tools)
+        selected = get_tools_for_intent(intent) or self.all_tools
         logger.info(
             "工具路由完成 | intent: %s | tools: %s",
             intent,
@@ -405,7 +378,7 @@ class Master:
         if not steps:
             return None
 
-        astro_tools = {"astro_natal_chart", "astro_current_chart", "astro_transit_chart", "astro_my_sign", "xingpan"}
+        astro_tools = ASTRO_TOOL_NAMES
         for step in reversed(steps):
             try:
                 action, observation = step

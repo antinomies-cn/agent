@@ -51,6 +51,61 @@ def test_tools_endpoint_wraps_plain_text_result(monkeypatch):
     assert body["explanation"] == ""
 
 
+def test_tools_invoke_endpoint_wraps_plain_text_result(monkeypatch):
+    monkeypatch.setattr(tools_router, "search", _Invoker("plain text result"))
+
+    client = TestClient(main.app)
+    resp = client.post("/tools/invoke/search", json={"query": "hello"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tool"] == "search"
+    assert body["ok"] is True
+    assert body["code"] == "OK"
+    assert body["data"] == "plain text result"
+
+
+def test_tools_invoke_endpoint_returns_not_found_for_unknown_tool():
+    client = TestClient(main.app)
+    resp = client.post("/tools/invoke/not_exists", json={})
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["error_code"] == "TOOL_NOT_FOUND"
+
+
+def test_tools_invoke_endpoint_returns_validation_error_for_bad_payload():
+    client = TestClient(main.app)
+    resp = client.post("/tools/invoke/search", json={})
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error_code"] == "REQUEST_VALIDATION_ERROR"
+    assert body["error"]["errors"]
+
+
+def test_tools_schema_endpoint_returns_args_schema():
+    client = TestClient(main.app)
+    resp = client.get("/tools/schema/search")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tool"] == "search"
+    assert isinstance(body["schema"], dict)
+
+
+def test_tools_legacy_routes_marked_deprecated_in_openapi():
+    client = TestClient(main.app)
+    resp = client.get("/openapi.json")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    paths = body["paths"]
+
+    assert paths["/tools/test"]["post"]["deprecated"] is True
+    assert paths["/tools/invoke/{tool_name}"]["post"].get("deprecated") is not True
+
+
 def test_debug_ui_page_is_served():
     client = TestClient(main.app)
     resp = client.get("/debug/ui")
